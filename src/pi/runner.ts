@@ -238,6 +238,7 @@ export class PiRunner {
       PI_ALERT_CHILD_ARGS: JSON.stringify(args),
       PI_ALERT_CHILD_CWD: input.cwd,
       PI_ALERT_KILL_GRACE_MS: String(this.config.killGraceMs ?? 5_000),
+      PI_ALERT_TRACE_FD: "3",
     };
     const started = Date.now();
     let child: ChildProcess;
@@ -254,6 +255,7 @@ export class PiRunner {
       let usage: unknown;
       let plan: unknown;
       let completion: unknown;
+      let failure: PiRunError | undefined;
       let reason: "cancelled" | "timed_out" | undefined;
       let killTimer: NodeJS.Timeout | undefined;
       const timeout = setTimeout(() => terminate("timed_out"), this.config.timeoutMs ?? 3_600_000);
@@ -269,10 +271,12 @@ export class PiRunner {
       input.signal?.addEventListener("abort", onAbort, { once: true });
 
       const fail = (error: PiRunError) => {
+        if (failure) return;
+        failure = error;
         stop(child, "SIGKILL");
-        rejectRun(error);
       };
       const consume = (line: string) => {
+        if (failure) return;
         let event: EventRecord;
         try {
           event = JSON.parse(line) as EventRecord;
@@ -307,6 +311,7 @@ export class PiRunner {
         if (killTimer) clearTimeout(killTimer);
         input.signal?.removeEventListener("abort", onAbort);
         if (buffer.trim()) consume(buffer.replace(/\r$/, ""));
+        if (failure) return rejectRun(failure);
         if (reason) return rejectRun(new PiRunError(reason, reason === "timed_out" ? "Pi run timed out" : "Pi run cancelled", stderr));
         if (code !== 0) return rejectRun(new PiRunError("exit", `Pi exited with ${code ?? signal ?? "unknown status"}`, stderr));
         const common = { taskId: input.taskId, runId: input.runId, sessionId: id, durationMs: Date.now() - started, usage };

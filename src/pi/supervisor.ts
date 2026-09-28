@@ -13,9 +13,26 @@ const {
   PI_ALERT_KILL_GRACE_MS: _grace,
   ...env
 } = process.env;
-const child = spawn(command, args as string[], { cwd, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
-child.stdout.pipe(process.stdout);
-child.stderr.pipe(process.stderr);
+const child = spawn(command, args as string[], { cwd, env, detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe", "pipe"] });
+
+function forwardLines(stream: NodeJS.ReadableStream): void {
+  let buffer = "";
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk: string) => {
+    buffer += chunk;
+    for (;;) {
+      const end = buffer.indexOf("\n");
+      if (end < 0) return;
+      process.stdout.write(buffer.slice(0, end + 1));
+      buffer = buffer.slice(end + 1);
+    }
+  });
+  stream.on("end", () => { if (buffer) process.stdout.write(buffer); });
+}
+
+forwardLines(child.stdout!);
+forwardLines(child.stdio[3]! as NodeJS.ReadableStream);
+child.stderr!.pipe(process.stderr);
 
 let stopping = false;
 function kill(signal: NodeJS.Signals): void {
@@ -44,5 +61,7 @@ child.on("error", (error) => {
   process.stderr.write(`${error.stack ?? error.message}\n`);
   process.exitCode = 1;
 });
-child.on("close", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+child.on("close", (code, signal) => {
+  process.stdout.write("", () => process.exit(code ?? (signal ? 1 : 0)));
+});
 if (!process.connected) stop();

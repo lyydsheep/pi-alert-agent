@@ -70,6 +70,27 @@ test("returns completion fields from an execution round", async () => {
   }
 });
 
+test("keeps large provider traces separate from Pi JSONL writes", async () => {
+  const { root, runner } = await setup();
+  const events: unknown[] = [];
+  try {
+    const result = await runner.run({
+      taskId: "task-large-trace",
+      runId: "run-large-trace",
+      cwd: root,
+      sessionPath: join(root, "sessions"),
+      prompt: "fix [interleave]",
+      phase: "execute",
+      onEvent: (event) => events.push(event),
+    });
+    assert.equal(result.status, "completed");
+    const trace = events.find((event) => (event as { type?: unknown }).type === "pi_provider_request") as { payload: { padding: string } };
+    assert.equal(trace.payload.padding.length, 2 * 1024 * 1024);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("supports no-code investigation completion and expanded execution plans", async () => {
   const { root, runner } = await setup();
   try {
@@ -116,6 +137,16 @@ test("classifies deadline and caller cancellation separately", async () => {
   } finally {
     await rm(cancelled.root, { recursive: true, force: true });
   }
+});
+
+test("protocol failure waits for Pi and its supervisor to exit before returning", async () => {
+  const {root,capture,runner}=await setup();
+  try {
+    await assert.rejects(runner.run({taskId:'bad-json',runId:'bad-json',cwd:root,sessionPath:join(root,'sessions'),phase:'investigate',prompt:'[invalid-json]'}),
+      (error:unknown)=>error instanceof PiRunError&&error.kind==='protocol');
+    const pids=JSON.parse(await readFile(capture,'utf8')) as Record<string,number>;
+    for(const pid of Object.values(pids))assert.throws(()=>process.kill(pid,0),{code:'ESRCH'});
+  } finally { await rm(root,{recursive:true,force:true}); }
 });
 
 test("supervisor terminates Pi when its parent IPC connection disappears", async () => {
@@ -195,7 +226,7 @@ test("installed Pi CLI loads the extension and resumes a session against a mock 
       runId: "run-1",
       cwd: root,
       sessionPath: join(root, "sessions"),
-      prompt: "Use the synthetic result tool.",
+      prompt: `Use the synthetic result tool. ${"x".repeat(120_000)}`,
       phase: "investigate" as const,
       onEvent(event: unknown) {
         seenEventTypes.push(event && typeof event === "object" ? (event as { type?: unknown }).type : undefined);
@@ -210,6 +241,7 @@ test("installed Pi CLI loads the extension and resumes a session against a mock 
     assert.equal(providerEvents.length, requests.length, `seen events: ${JSON.stringify(seenEventTypes)}`);
     assert.equal(providerEvents[0].provider, "fixture");
     assert.equal(providerEvents[0].model, "fixture");
+    assert(JSON.stringify(providerEvents[0]).length > 100_000);
     for (let index = 0; index < requests.length; index += 1) assert.deepEqual(providerEvents[index].payload, requests[index]);
     assert((providerEvents[0].payload.messages as Array<{ role: string }>).some((message) => message.role === "system"));
     assert((providerEvents[0].payload.tools as Array<{ function: { name: string } }>).some((tool) => tool.function.name === "submit_plan"));

@@ -82,15 +82,14 @@ export default function register(pi: ExtensionApi): void {
     } };
   });
   pi.on?.("before_provider_request", (event, context) => {
-    const line = JSON.stringify({
+    const output = Buffer.from(`${JSON.stringify({
       type: "pi_provider_request",
       provider: context.model?.provider,
       model: context.model?.id,
       payload: event.payload,
-    });
-    // Pi redirects process.stdout.write() to stderr in print mode. Writing the
-    // inherited stdout descriptor preserves this event in the JSONL stream.
-    writeSync(process.stdout.fd, `${line}\n`);
+    })}\n`);
+    const fd = Number(process.env.PI_ALERT_TRACE_FD ?? process.stdout.fd);
+    for (let offset = 0; offset < output.length;) offset += writeSync(fd, output, offset);
   });
 
   for (const [name, description, parameters] of [

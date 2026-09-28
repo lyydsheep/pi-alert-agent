@@ -5,7 +5,11 @@ const value = (flag) => args[args.indexOf(flag) + 1];
 const capture = value("--capture");
 const prompt = args.at(-1);
 
-if (prompt.includes("[hang]")) {
+if (prompt.includes("[invalid-json]")) {
+  await writeFile(capture, JSON.stringify({pi:process.pid,supervisor:process.ppid}));
+  process.stdout.write('invalid-json\n');
+  setInterval(() => {}, 1_000);
+} else if (prompt.includes("[hang]")) {
   process.on("SIGTERM", async () => {
     if (capture) await writeFile(`${capture}.terminated`, "SIGTERM");
     process.exit(0);
@@ -50,6 +54,19 @@ if (prompt.includes("[hang]")) {
       ? "submit_plan"
       : prompt.includes("phase investigate") ? "submit_plan" : "submit_completion";
   const toolArgs = toolName === "submit_plan" ? plan : completion;
+  if (prompt.includes("[interleave]")) {
+    const traceSize = 2 * 1024 * 1024;
+    const native = `${JSON.stringify({ type: "message_update", usage: { input: 4, output: 2 }, padding: "n".repeat(100_000) })}\n`;
+    const extension = await import(value("--extension"));
+    let beforeProviderRequest;
+    extension.default({
+      registerTool() {},
+      on(_event, handler) { beforeProviderRequest = handler; },
+    });
+    process.stdout.write(native.slice(0, 50_000));
+    beforeProviderRequest({ payload: { padding: "t".repeat(traceSize) } }, { model: { provider: "fixture", id: "fixture" } });
+    process.stdout.write(native.slice(50_000));
+  }
   process.stdout.write(`${JSON.stringify({ type: "session", id: value("--session-id") })}\n`);
   process.stdout.write(`${JSON.stringify({ type: "message_update", usage: { input: 4, output: 2 } })}\n`);
   process.stdout.write(`${JSON.stringify({ type: "tool_execution_start", toolName, args: toolArgs })}\n`);
