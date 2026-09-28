@@ -98,7 +98,7 @@ test('resumes registered and retained legacy branches', async () => {
   const fixture = await repository();
   const manager = new GitWorkspaceManager({ repositoryPath: fixture.repo, worktreeRoot: fixture.worktrees });
   await mkdir(fixture.worktrees);
-  git(fixture.repo, 'branch', 'master', 'origin/master');
+  git(fixture.repo, 'checkout', '-B', 'master', 'origin/master');
   git(fixture.repo, 'worktree', 'add', '-b', 'fix/faizili_registered', join(fixture.worktrees, 'registered'), 'master');
   git(fixture.repo, 'branch', 'feat/faizili_retained', 'master');
 
