@@ -116,7 +116,7 @@ test('exports complete Pi events as correlated OTLP/OpenInference spans without 
     observer.event('task-1', 'run-1', { type: 'message_end', message: { role: 'assistant', provider: 'test-provider', model: 'test-model', usage: { input: 4, output: 2 }, content: large } });
     observer.event('task-1', 'run-1', { type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'query_logs', args: { query: large } });
     observer.event('task-1', 'run-1', { type: 'tool_execution_update', toolCallId: 'call-1', partialResult: 'partial' });
-    observer.event('task-1', 'run-1', { type: 'tool_execution_end', toolCallId: 'call-1', result: { text: 'failed' }, isError: true });
+    observer.event('task-1', 'run-1', { type: 'tool_execution_end', toolCallId: 'call-1', result: { text: 'failed', details: {fullOutput: large.repeat(10)} }, isError: true });
     observer.event('task-1', 'run-1', { type: 'agent_settled' });
     observer.event('task-1', 'run-1', { type: 'run_end' });
     observer.event('task-2', 'run-2', { type: 'agent_start' });
@@ -147,6 +147,7 @@ test('exports complete Pi events as correlated OTLP/OpenInference spans without 
     assert.ok(BigInt(spans.find((span) => span.name === 'pi.llm')!.endTimeUnixNano as string) > BigInt(spans.find((span) => span.name === 'pi.llm')!.startTimeUnixNano as string));
     const tool = attributes(spans.find((span) => span.name === 'pi.tool.query_logs')!);
     assert.equal((JSON.parse(tool['input.value']!) as { query: string }).query.length, large.length);
+    assert.ok(JSON.parse(tool['output.value']!).details.fullOutput===large.repeat(10),'full bash output survives OTLP encoding');
     assert.deepEqual(spans.find((span) => span.name === 'pi.tool.query_logs')?.status, { code: 2, message: 'tool execution failed' });
     assert.deepEqual(spans.find((span) => span.name === 'pi.run' && (span.status as { code: number }).code === 2)?.status, { code: 2, message: 'cancelled' });
   } finally {

@@ -1,8 +1,10 @@
 import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
+import { createBashToolDefinition, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
 
 type ExtensionApi = {
   registerTool(tool: Record<string, unknown>): void;
+  on?(event: "tool_result", handler: (event: {toolName:string;toolCallId:string;details?:unknown}) => {details:Record<string,unknown>} | undefined): void;
   on?(
     event: "before_provider_request",
     handler: (event: { payload: unknown }, context: { model?: { provider?: string; id?: string } }) => void | Promise<void>,
@@ -58,6 +60,27 @@ function execute(spec: { command: string; args: string[] }, input: Record<string
 }
 
 export default function register(pi: ExtensionApi): void {
+  const bash = createBashToolDefinition(process.cwd());
+  const operations = createLocalBashOperations();
+  const outputs = new Map<string, Buffer[]>();
+  pi.registerTool({ ...bash, async execute(...args: Parameters<typeof bash.execute>) {
+    const chunks: Buffer[] = [];
+    outputs.set(args[0], chunks);
+    const tool = createBashToolDefinition(process.cwd(), { operations: {
+      exec: (command, cwd, execution) => operations.exec(command, cwd, { ...execution,
+        onData: (data) => { chunks.push(Buffer.from(data)); execution.onData(data); },
+      }),
+    } });
+    return tool.execute(...args);
+  } });
+  pi.on?.("tool_result", (event) => {
+    const chunks = event.toolName === "bash" ? outputs.get(event.toolCallId) : undefined;
+    if (!chunks) return;
+    outputs.delete(event.toolCallId);
+    return { details: { ...(event.details && typeof event.details === "object" ? event.details : {}),
+      fullOutput: Buffer.concat(chunks).toString("utf8"),
+    } };
+  });
   pi.on?.("before_provider_request", (event, context) => {
     const line = JSON.stringify({
       type: "pi_provider_request",
