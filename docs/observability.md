@@ -43,3 +43,7 @@ The deployment provisioning script now explicitly patches the default policy to 
 Pi limits the text returned to the model by its built-in bash tool. The alert extension wraps Pi's native BashOperations.onData and attaches the complete merged stdout/stderr text to `result.details.fullOutput` through the native tool_result hook, including failed commands. Existing content, truncation metadata, timeout, cancellation and error status remain intact. The observer exports that result as TOOL output; it does not read arbitrary output-file paths or enlarge the model's tool-message content. Captured chunks are removed when the matching result hook consumes them.
 
 Real Pi/Phoenix acceptance on2026-09-28 read back two bash spans (success and intentional exit3), each with exactly200010bytes andSHA2561b4c3737aeef6d6642735ab873f519db10bd08673761619fef78de55f2679e83. Provider payloads did not contain the fullOutput detail. This confirms the actual exporter/storage path beyond the native truncation threshold, rather than only checking a20KB fixture.
+
+### Deployed retention audit (2026-09-28)
+
+The running AnyDev Phoenix database contains one project (`default`) and one retention policy (ID 0). Its rule is `max_days=7`, with `cron_expression="0 * * * *"`; the project has no policy override. Phoenix 20.16.0 `TraceDataSweeper._apply` selects projects whose policy ID is null when applying default policy 0, confirming this project inherits the seven-day hourly policy. This verifies all projects present at audit time; audit again if project overrides are added.

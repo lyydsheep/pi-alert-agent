@@ -38,7 +38,7 @@
 
 `deploy/pi-alert-agent.service` 是该路径对应的 systemd 单元。准备仅包含测试群和测试仓库的 `private/config.json`、`private/runtime.env`（权限 0600）后，再安装并启动单元。未取得这些配置前，不启动企微连接，也不启用开机启动。主服务可以直接用绝对 Node 路径执行；Pi 子进程解析项目内固定版本，不依赖全局 `pi` 命令。
 
-主机验证已通过：`npm run check`、79 项行为测试（含实际 Pi CLI + 本地模拟模型接口、Git worktree、SQLite 备份恢复）及 systemd 单元静态检查。另已验证真实模型调用/会话续接、测试群告警接收及托管 MR 状态读取；这些证据不代表完整交付链路完成。四份业务大仓 worktree 实测约 34.08 GiB，四个真实 Pi 任务已分别完成代表性业务 Bazel 测试，共享 shell 同时执行上限为 1；最低剩余磁盘 8.82 GiB、最低可用内存 37.47 GiB。该结果不代表所有服务的构建容量或四条完整告警交付链路。
+主机验证已通过：`npm run check`、81 项行为测试（含实际 Pi CLI + 本地模拟模型接口、Git worktree、SQLite 备份恢复）及 systemd 单元静态检查。另已验证真实模型调用/会话续接、测试群告警接收及托管 MR 状态读取；这些证据不代表完整交付链路完成。四份业务大仓 worktree 实测约 34.08 GiB，四个真实 Pi 任务已分别完成代表性业务 Bazel 测试，共享 shell 同时执行上限为 1；最低剩余磁盘 8.82 GiB、最低可用内存 37.47 GiB。该结果不代表所有服务的构建容量或四条完整告警交付链路。
 
 ## Phoenix 独立部署文件
 
@@ -80,6 +80,16 @@ If the authenticated WeCom text includes a leading bot mention, set `bot.mention
 
 查询脚本、查询凭据、工蜂 MCP 配置、平台鉴权程序与审核结果解析器保存在新部署的 `private/` 目录，目录权限 0700、配置权限 0600；查询与 MR 桥接使用新服务自己的 Python/Node。私有适配器需单独备份和迁移，不随公开仓库发布。工蜂桥接仍使用宿主安装的工蜂 MCP CLI；迁移到新宿主时需准备该平台工具。
 
-真实只读 MR 状态读取已在最小环境中通过；尚未据此宣称新建 MR、审核触发或完整切换完成。机器人记录鉴权、断连、重连事件以及收到消息的群是否已配置，不记录消息正文或身份凭据。
+真实只读 MR 状态读取已在最小环境中通过；后续独立 Draft MR 创建与审核触发证据见下文，完整切换仍未完成。机器人记录鉴权、断连、重连事件以及收到消息的群是否已配置，不记录消息正文或身份凭据。
 
 2026-09-28 真实恢复演练：停止测试群主服务后，备份并在原路径恢复实际任务的 8 张数据库表、2 个会话文件及业务 worktree。所有行和会话哈希一致，worktree HEAD/状态一致，覆盖已有目录被拒绝；重启后任务保持原阻塞状态。首次演练发现相对符号链接被复制为绝对链接，现已修复并验证 6 个真实链接保留。此任务尚无方案或 MR，因此尚未覆盖真实 MR 创建后的恢复。18 个私有配置及适配资产另行归档并验证文件哈希。
+
+### Real Draft MR adapter acceptance (2026-09-28)
+
+A clearly labeled temporary marker was committed and pushed to the authorized test repository through `GitWorkspaceManager`. The private command adapter created a real Draft MR, returned the same MR on repeated creation requests, verified the current HEAD, and returned the same AgentReview receipt on repeated requests. The CI push check passed. AgentReview subsequently failed because the marker explicitly must not be merged; the adapter reported that failure and `complete=false`, while platform-required checks remained pending. No approval or merge was attempted. This verifies external adapter behavior and the failed-review gate, not the real alert investigation-to-delivery lifecycle or a successful current-HEAD review.
+
+### Isolated post-MR receipt recovery (2026-09-28)
+
+A synthetic Owner/group fixture drove the production `AlertService` to `awaiting_checks`, using the real Draft MR receipt and copied real session/delivery-journal files. Production backup/restore preserved every row in all ten tables, all four session files, the delivery journal and the exact MR/HEAD receipt; restoring over existing data was rejected. After restoration, the production service consumed its pending MR notification once. A second pump and another service restart produced no additional notification, runner invocation, push or MR creation. Two read-only external status queries confirmed the retained MR/branch/HEAD and failed-review state; no external write was made.
+
+The business worktree and refs were retained and verified in place, not recopied by this fixture. Actual task data and the old Agent were untouched. MR polling was not resumed in this fixture because its known failed review would legitimately schedule a retry. This adds persisted-receipt and notification-recovery evidence; it does not prove a real WeCom Owner lifecycle or full post-MR business-worktree restoration.
