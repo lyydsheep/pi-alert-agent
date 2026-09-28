@@ -46,6 +46,7 @@ try {
         return { taskId, path: workspacePath, branch: `fix/faizili_${taskId}`, head: 'base-head', resumed: true };
       },
       push: async () => ({ head: 'head-1', alreadyPresent: true }),
+      status: async () => '',
       head: async () => 'base-head',
       cleanup: async () => false,
     },

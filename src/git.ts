@@ -114,6 +114,10 @@ export class GitWorkspaceManager {
     return run('git', ['rev-parse', 'HEAD'], workspacePath, this.timeoutMs, signal);
   }
 
+  status(workspacePath: string): Promise<string> {
+    return run('git', ['status', '--porcelain'], workspacePath, this.timeoutMs);
+  }
+
   async push(workspace: Pick<GitWorkspace, 'path' | 'branch'>, signal?: AbortSignal): Promise<PushResult> {
     const branch = workspace.branch;
     if (!/^(fix|feat)\/faizili_[A-Za-z0-9._-]+$/.test(branch)) throw new Error(`Refusing to push unexpected branch: ${branch}`);

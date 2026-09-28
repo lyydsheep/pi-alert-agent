@@ -444,6 +444,12 @@ export class Engine {
       const now = this.clock();
       const task = this.requireTask(taskId);
       const state = input.state ?? 'open';
+      // A stopped run may report an already completed write, but cannot resume the task.
+      if(['paused','rejected'].includes(task.status)&&input.run&&task.runFence===input.run.fence+1&&task.planVersion===input.run.planVersion
+        &&this.store.get("SELECT id FROM outbox WHERE task_id=? AND type='stop_run' AND json_extract(payload,'$.runId')=? AND json_extract(payload,'$.fence')=?",task.id,input.run.runId,input.run.fence)) {
+        this.store.run('UPDATE tasks SET mr_url=?,branch=?,head_sha=?,mr_state=?,updated_at=? WHERE id=?',input.url,input.branch,input.headSha,state,now,task.id);
+        return {task:this.readTask(task.id)!,effects:[],accepted:true};
+      }
       if (state !== 'open') {
         if (task.status !== 'running' || !input.run || input.run.runId !== task.runId
           || input.run.fence !== task.runFence || input.run.planVersion !== task.planVersion) {

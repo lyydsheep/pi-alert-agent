@@ -91,6 +91,7 @@ test('refuses cleanup when committed restoration would lose work', async () => {
   const manager = new GitWorkspaceManager({ repositoryPath: fixture.repo, worktreeRoot: fixture.worktrees });
   const workspace = await manager.prepare('dirty');
   await writeFile(join(workspace.path, 'dirty.txt'), 'uncommitted\n');
+  assert.match(await manager.status(workspace.path), /dirty\.txt/);
   await assert.rejects(() => manager.cleanup(workspace, 0, 8 * 24 * 60 * 60 * 1_000), /uncommitted changes/);
 });
 

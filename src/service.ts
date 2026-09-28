@@ -12,7 +12,7 @@ import { DeliveryHttpError } from './delivery.ts';
 
 export interface ServiceDependencies {
   runner: Pick<PiRunner,'run'>;
-  git: Pick<GitWorkspaceManager,'prepare'|'push'|'head'|'cleanup'>;
+  git: Pick<GitWorkspaceManager,'prepare'|'push'|'head'|'status'|'cleanup'>;
   delivery: Pick<GitLabDeliveryClient,'createOrReadMergeRequest'|'status'|'feedback'> & {
     ensureAgentReview?: (mrIid:number,expectedHead:string,signal?:AbortSignal)=>Promise<unknown>;
   };
@@ -42,7 +42,8 @@ export class AlertService {
     this.store.db.exec(`CREATE TABLE IF NOT EXISTS inbox (message_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS runtime (task_id INTEGER PRIMARY KEY, workspace TEXT, mr_iid INTEGER, feedback_id INTEGER NOT NULL DEFAULT 0, progress_key TEXT);
       CREATE TABLE IF NOT EXISTS effect_retry (effect_id INTEGER PRIMARY KEY, next_at INTEGER NOT NULL, attempts INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS progress_observations (task_id INTEGER NOT NULL REFERENCES tasks(id), fingerprint TEXT NOT NULL, PRIMARY KEY(task_id,fingerprint));`);
+      CREATE TABLE IF NOT EXISTS progress_observations (task_id INTEGER NOT NULL REFERENCES tasks(id), fingerprint TEXT NOT NULL, PRIMARY KEY(task_id,fingerprint));
+      CREATE TABLE IF NOT EXISTS run_receipts (run_id TEXT PRIMARY KEY,task_id INTEGER NOT NULL REFERENCES tasks(id),workspace TEXT,push_started INTEGER NOT NULL DEFAULT 0,push_head TEXT,mr_started INTEGER NOT NULL DEFAULT 0,mr TEXT,stop_report TEXT);`);
   }
 
   async receive(message:IncomingMessage):Promise<void> {
@@ -111,6 +112,7 @@ export class AlertService {
     if(effect.type==='stop_run') {
       const running=this.active.get(task.id);
       if(running && running.runId===effect.payload.runId){running.controller.abort();await running.promise;}
+      if(effect.payload.reason==='owner_pause'||effect.payload.reason==='owner_reject')await this.reportStoppedRun(task,effect);
       return true;
     }
     if(effect.type==='start_run') {
@@ -144,13 +146,37 @@ export class AlertService {
     return true;
   }
 
+  private async reportStoppedRun(task:Task,effect:Effect):Promise<void> {
+    const runId=String(effect.payload.runId);
+    const missingReceipt=Boolean(this.store.run('INSERT OR IGNORE INTO run_receipts(run_id,task_id) VALUES(?,?)',runId,task.id).changes);
+    const receipt=this.store.get<{workspace:string|null;push_started:number;push_head:string|null;mr_started:number;mr:string|null;stop_report:string|null}>('SELECT * FROM run_receipts WHERE run_id=?',runId)!;
+    let report=receipt.stop_report;
+    if(!report) {
+      let local='工作区进度尚未确认，请核实；保留已有文件。';
+      if(receipt.workspace) {
+        try {
+          const head=await this.deps.git.head(receipt.workspace);
+          const status=await this.deps.git.status(receipt.workspace);
+          local=`本地 HEAD：${head}；${status?`${status.split('\n').length} 项未提交改动，已保留`:'无未提交改动'}。`;
+        } catch {local='无法读取本地工作区进度，请核实；保留已有文件。';}
+      }
+      const push=missingReceipt?'没有本轮推送回执，结果待核实':receipt.push_head?`已确认推送：${receipt.push_head}`:receipt.push_started?'推送已发起，结果待核实':'本轮未发起推送';
+      const mr=missingReceipt?'没有本轮 MR 回执，结果待核实':receipt.mr?`已确认 MR：${JSON.parse(receipt.mr).url}`:receipt.mr_started?'MR 请求已发起，结果待核实':task.mrUrl?`本轮未发起 MR 请求；保留已有 MR：${task.mrUrl}`:'本轮未发起 MR 请求';
+      report=`任务 #${task.id} 本轮执行已停止（${effect.payload.reason==='owner_pause'?'暂停':'拒绝'}）。\n${local}\n${push}\n${mr}\n已完成的修改与交付保留，恢复需明确指令。`;
+      this.store.run('UPDATE run_receipts SET stop_report=? WHERE run_id=?',report,runId);
+    }
+    await this.deps.notify(task.groupId,report,task.ownerIds);
+  }
+
   private async execute(task:Task,effect:Effect,signal:AbortSignal):Promise<void> {
     const identity={taskId:task.id,runId:String(effect.payload.runId),fence:Number(effect.payload.fence),planVersion:Number(effect.payload.planVersion)};
     const valid=()=>{const current=this.engine.getTask(task.id);return !signal.aborted&&current?.status==='running'&&current.runId===identity.runId&&current.runFence===identity.fence&&current.planVersion===identity.planVersion;};
     try {
+      this.store.run('INSERT OR IGNORE INTO run_receipts(run_id,task_id) VALUES(?,?)',identity.runId,task.id);
       const workspace=await this.deps.git.prepare(String(task.id),'fix',signal,task.headSha??undefined);
-      if(!valid())return;
+      this.store.run('UPDATE run_receipts SET workspace=? WHERE run_id=?',workspace.path,identity.runId);
       this.store.run('INSERT INTO runtime(task_id,workspace) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET workspace=excluded.workspace',task.id,JSON.stringify(workspace));
+      if(!valid())return;
       const fixing=effect.payload.phase==='fix';
       const prompt=[`任务 #${task.id}。阶段：${fixing?'执行已授权方案':'只读调查与临时复现，禁止修改业务代码'}。`,
         '遵循仓库规范。只能处理本任务，不查询其他任务或其他 MR。不得合并、部署、强推或执行生产写操作。',
@@ -197,10 +223,16 @@ export class AlertService {
       } else {
         if(!valid())return;
         if(task.mrUrl&&actualHead===task.headSha){this.engine.completeRun({...identity,progress,next:'awaiting_checks',reason:'No new commit; waiting for current-head checks'});return;}
+        this.store.run('UPDATE run_receipts SET push_started=1 WHERE run_id=?',identity.runId);
         const pushed=await this.deps.git.push(workspace,signal);
-        if(!valid())return;
+        this.store.run('UPDATE run_receipts SET push_head=? WHERE run_id=?',pushed.head,identity.runId);
+        if(!valid()){
+          if(task.mrUrl)this.engine.recordMr(task.id,{url:task.mrUrl,branch:workspace.branch,headSha:pushed.head,state:task.mrState==='closed'?'closed':task.mrState==='merged'?'merged':'open',run:identity});
+          return;
+        }
+        this.store.run('UPDATE run_receipts SET mr_started=1 WHERE run_id=?',identity.runId);
         const mr=await this.deps.delivery.createOrReadMergeRequest({sourceBranch:workspace.branch,title:`fix: alert task ${task.id}`,description:`任务 #${task.id}\n\n${task.plan?.body??''}\n\n${JSON.stringify(result.completion,null,2)}`},signal);
-        if(!valid())return;
+        this.store.run('UPDATE run_receipts SET mr=? WHERE run_id=?',JSON.stringify(mr),identity.runId);
         this.store.run('UPDATE runtime SET mr_iid=? WHERE task_id=?',mr.iid,task.id);
         const recorded=this.engine.recordMr(task.id,{url:mr.url,branch:workspace.branch,headSha:pushed.head,state:mr.state==='merged'?'merged':mr.state==='closed'?'closed':'open',run:identity});
         if(!recorded.accepted)return;
