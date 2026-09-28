@@ -64,7 +64,7 @@ test('creates from remote master, resumes, safely pushes, cleans, and restores',
   const manager = new GitWorkspaceManager({ repositoryPath: fixture.repo, worktreeRoot: fixture.worktrees });
 
   const workspace = await manager.prepare('task-1');
-  assert.equal(workspace.branch, 'fix/faizili_task-1');
+  assert.equal(workspace.branch, 'bugfix/faizili_task-1');
   assert.equal(workspace.resumed, false);
   assert.equal(await manager.prepare('task-1').then((value) => value.resumed), true);
 
@@ -79,11 +79,34 @@ test('creates from remote master, resumes, safely pushes, cleans, and restores',
   assert.equal((await manager.push(workspace)).alreadyPresent, true);
   assert.equal(await manager.cleanup(workspace, 0, 7 * 24 * 60 * 60 * 1_000 - 1), false);
   assert.equal(await manager.cleanup(workspace, 0, 7 * 24 * 60 * 60 * 1_000), true);
-  assert.ok(git(fixture.repo, 'show-ref', '--verify', 'refs/heads/fix/faizili_task-1'));
+  assert.ok(git(fixture.repo, 'show-ref', '--verify', 'refs/heads/bugfix/faizili_task-1'));
 
   const restored = await manager.prepare('task-1');
   assert.equal(restored.resumed, true);
   assert.equal(restored.head, pushedHead);
+});
+
+test('maps new logical kinds to Gongfeng branch prefixes', async () => {
+  const fixture = await repository();
+  const manager = new GitWorkspaceManager({ repositoryPath: fixture.repo, worktreeRoot: fixture.worktrees });
+
+  assert.equal((await manager.prepare('fix-kind', 'fix')).branch, 'bugfix/faizili_fix-kind');
+  assert.equal((await manager.prepare('feat-kind', 'feat')).branch, 'feature/faizili_feat-kind');
+});
+
+test('resumes registered and retained legacy branches', async () => {
+  const fixture = await repository();
+  const manager = new GitWorkspaceManager({ repositoryPath: fixture.repo, worktreeRoot: fixture.worktrees });
+  await mkdir(fixture.worktrees);
+  git(fixture.repo, 'branch', 'master', 'origin/master');
+  git(fixture.repo, 'worktree', 'add', '-b', 'fix/faizili_registered', join(fixture.worktrees, 'registered'), 'master');
+  git(fixture.repo, 'branch', 'feat/faizili_retained', 'master');
+
+  assert.equal((await manager.prepare('registered', 'fix')).branch, 'fix/faizili_registered');
+  const retained = await manager.prepare('retained', 'feat');
+  assert.equal(retained.branch, 'feat/faizili_retained');
+  assert.equal((await manager.push(retained)).alreadyPresent, false);
+  assert.ok(git(fixture.repo, 'ls-remote', '--heads', 'origin', 'refs/heads/feat/faizili_retained'));
 });
 
 test('refuses cleanup when committed restoration would lose work', async () => {
@@ -186,5 +209,5 @@ test('does not create a missing local branch when an MR HEAD is expected', async
     () => manager.prepare('missing', 'fix', undefined, masterHead),
     GitWorkspaceConflictError,
   );
-  assert.throws(() => git(fixture.repo, 'show-ref', '--verify', 'refs/heads/fix/faizili_missing'));
+  assert.throws(() => git(fixture.repo, 'show-ref', '--verify', 'refs/heads/bugfix/faizili_missing'));
 });

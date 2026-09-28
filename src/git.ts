@@ -82,25 +82,28 @@ export class GitWorkspaceManager {
 
   async prepare(taskId: string, kind: 'fix' | 'feat' = 'fix', signal?: AbortSignal, expectedHead?: string): Promise<GitWorkspace> {
     const id = taskPart(taskId);
-    const branch = `${kind}/faizili_${id}`;
+    const branch = `${kind === 'fix' ? 'bugfix' : 'feature'}/faizili_${id}`;
+    const legacyBranch = `${kind}/faizili_${id}`;
     const path = join(this.worktreeRoot, id);
     const registered = await this.worktrees(signal);
     const pathExists = await exists(path);
     const current = registered.get(await canonical(path));
 
     if (current) {
-      if (current !== branch) throw new Error(`Worktree ${path} is attached to ${current}, expected ${branch}`);
-      if (expectedHead) await this.syncExpectedHead(path, branch, expectedHead, signal);
-      return { taskId, path, branch, head: await this.head(path, signal), resumed: true };
+      if (current !== branch && current !== legacyBranch) throw new Error(`Worktree ${path} is attached to ${current}, expected ${branch}`);
+      if (expectedHead) await this.syncExpectedHead(path, current, expectedHead, signal);
+      return { taskId, path, branch: current, head: await this.head(path, signal), resumed: true };
     }
 
     if (pathExists) throw new Error(`Workspace path already exists but is not a registered worktree: ${path}`);
     await mkdir(this.worktreeRoot, { recursive: true });
 
-    if (await this.localBranchExists(branch, signal)) {
-      await this.git(['worktree', 'add', path, branch], signal);
-      if (expectedHead) await this.syncExpectedHead(path, branch, expectedHead, signal);
-      return { taskId, path, branch, head: await this.head(path, signal), resumed: true };
+    const retainedBranch = await this.localBranchExists(branch, signal) ? branch
+      : await this.localBranchExists(legacyBranch, signal) ? legacyBranch : undefined;
+    if (retainedBranch) {
+      await this.git(['worktree', 'add', path, retainedBranch], signal);
+      if (expectedHead) await this.syncExpectedHead(path, retainedBranch, expectedHead, signal);
+      return { taskId, path, branch: retainedBranch, head: await this.head(path, signal), resumed: true };
     }
 
     if (expectedHead) throw new GitWorkspaceConflictError(`Cannot resume ${branch}: the local branch is missing`);
@@ -120,7 +123,7 @@ export class GitWorkspaceManager {
 
   async push(workspace: Pick<GitWorkspace, 'path' | 'branch'>, signal?: AbortSignal): Promise<PushResult> {
     const branch = workspace.branch;
-    if (!/^(fix|feat)\/faizili_[A-Za-z0-9._-]+$/.test(branch)) throw new Error(`Refusing to push unexpected branch: ${branch}`);
+    if (!/^(?:bugfix|feature|fix|feat)\/faizili_[A-Za-z0-9._-]+$/.test(branch)) throw new Error(`Refusing to push unexpected branch: ${branch}`);
     const currentBranch = await run('git', ['branch', '--show-current'], workspace.path, this.timeoutMs, signal);
     if (currentBranch !== branch) throw new Error(`Refusing to push ${currentBranch || 'detached HEAD'} as ${branch}`);
     const head = await this.head(workspace.path, signal);
