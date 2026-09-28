@@ -33,7 +33,7 @@ An investigation normally calls `submit_plan`, but may call `submit_completion` 
 
 `AbortSignal` and the configured deadline first terminate the Pi process group, then force-kill it after the grace period. A small IPC supervisor applies the same cleanup when the main-service process disappears, preventing an orphaned Pi round from writing beside a recovered round. Each raw JSON event is also delivered to `onEvent`; observation failures are ignored so Phoenix outages do not block task execution.
 
-Immediately before every provider request, the extension emits `{type:"pi_provider_request", provider, model, payload}`. `payload` is the complete JSON request body, including the actual system prompt, conversation, and tools; API headers and credentials are not part of this event. Tool continuations and retries emit additional events because each is a separate provider request.
+Immediately before every provider request, the extension emits `{type:"pi_provider_request", provider, model, payload}`. `payload` is the complete JSON request body, including the actual system prompt, conversation, and tools; API headers and credentials are not part of this event. Tool continuations and retries emit additional events because each is a separate provider request. Provider events use a dedicated inherited pipe; the supervisor forwards complete records from that pipe and native Pi stdout through one writer. This avoids partial writes or interleaved records corrupting JSONL when model inputs are large. A 2 MiB trace regression and a real saved-session replay cover the transport. On malformed output, the runner waits for the Pi process and supervisor to exit before reporting failure, so a retry cannot race their writes.
 
 Execution rounds edit, test, and commit in the task worktree. They do not push or create an MR; the main service owns those externally visible, recoverable delivery steps.
 
@@ -48,3 +48,11 @@ Verified locally against the published `@earendil-works/pi-coding-agent` 0.87.1 
 - `before_provider_request` exposes the exact request body sent to the compatible endpoint, including system context, messages, and tools.
 
 The automated compatibility check uses a local synthetic OpenAI-compatible endpoint. It proves CLI, extension, event, endpoint, and session wiring without claiming that a real model or production credential was tested.
+
+## Shared host shell resources
+
+Configure `tools.shell` with a command and arguments that prefix `/bin/bash -c <exact command>`. Pi's built-in bash implementation still owns output handling, timeout and cancellation; the extension only supplies its native spawn hook. All prefix arguments and the original command are individually shell-quoted. Use absolute paths because execution cwd is the task worktree.
+
+On Linux, `scripts/limited-shell.sh SHARED_LOCK JOBS` uses host `flock` to allow one shell command at a time across tasks. Set the same lock path for every Pi runner; its parent directory must exist. Model calls and read/write tools remain concurrent. All shell commands use the slot, including nested scripts, avoiding fragile build-command classification. The lock is released by the OS when the process tree exits; queued cancellation and cancellation while holding the lock are tested. This is resource scheduling, not task dependency tracking or a permission sandbox.
+
+The wrapper sets worker defaults for Make, CMake, Cargo and Go; explicit command-line overrides can supersede build-tool environment settings. The model is instructed to respect the limit and supply an equivalent limit for tools such as Bazel. Tests should use task-local temporary artifacts, ephemeral ports and independent data. Current AnyDev configuration uses one shell slot and two workers per build. The wrapper requires Linux `flock`; other hosts must provide an equivalent configured wrapper.

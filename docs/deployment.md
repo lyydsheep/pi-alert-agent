@@ -15,7 +15,7 @@
 
 ## 备份恢复
 
-首版提供同机、同路径恢复。先停止主服务，执行 `node scripts/backup.ts backup DATA_DIR BACKUP_DIR`。备份包含 SQLite 一致性快照、会话、工作区和证据；目标业务仓库与其中的任务分支引用仍需单独保留。
+首版提供同机、同路径恢复。先停止主服务，执行 `node scripts/backup.ts backup DATA_DIR BACKUP_DIR`。备份包含 SQLite 一致性快照、会话、工作区和证据，并原样保留相对符号链接（包括悬空链接）；目标业务仓库与其中的任务分支引用仍需单独保留。外部交付适配器的 MR/审查幂等记录必须存放在 DATA_DIR 下，随 SQLite 同批备份和恢复；仅恢复 SQLite 会丢失“请求结果未知”的记录，可能重复发送。私有配置、凭据与适配脚本属于独立部署资产，应另行保留，不能提交公共仓库。
 
 恢复前归档现有数据目录，执行 `node scripts/backup.ts restore BACKUP_DIR ORIGINAL_DATA_DIR`。脚本拒绝覆盖已有目录或向不同路径恢复；校验原业务仓库仍存在，必要时执行 Git worktree repair，再启动。不要将此机制宣称为丢失整台主机后的完整灾备。
 
@@ -32,13 +32,13 @@
 
 这些是未完成的真实验收要求；本地替身测试通过不等于已经部署或切换。
 
-## AnyDev 验证目录（2026-09-27）
+## AnyDev 验证目录（2026-09-28）
 
-独立目录 `/data/workspace/pi-alert-agent-validation` 已创建；`runtime/node_modules/node/bin/node` 为 Node 24.21.0，`app/` 使用锁文件安装依赖。旧系统 Node 22.15 和应用目录没有变更。此目录目前用于验收，不代表服务已启用。
+独立目录 `/data/workspace/pi-alert-agent-validation` 已创建；`runtime/node_modules/node/bin/node` 为 Node 24.21.0，`app/` 使用锁文件安装依赖。旧系统 Node 22.15 和应用目录没有变更。主服务目前仅接入配置的测试群，用于真实链路验收。
 
 `deploy/pi-alert-agent.service` 是该路径对应的 systemd 单元。准备仅包含测试群和测试仓库的 `private/config.json`、`private/runtime.env`（权限 0600）后，再安装并启动单元。未取得这些配置前，不启动企微连接，也不启用开机启动。主服务可以直接用绝对 Node 路径执行；Pi 子进程解析项目内固定版本，不依赖全局 `pi` 命令。
 
-主机验证已通过：`npm run check`、52 项行为测试（含实际 Pi CLI + 本地模拟模型接口、Git worktree、SQLite 备份恢复）及 `systemd-analyze verify deploy/pi-alert-agent.service`。尚未启用该 systemd 单元；测试不包含真实企微、模型供应商或托管 MR 平台。业务大仓的四任务实际资源容量仍待测量。
+主机验证已通过：`npm run check`、79 项行为测试（含实际 Pi CLI + 本地模拟模型接口、Git worktree、SQLite 备份恢复）及 systemd 单元静态检查。另已验证真实模型调用/会话续接、测试群告警接收及托管 MR 状态读取；这些证据不代表完整交付链路完成。四份业务大仓 worktree 实测约 34.08 GiB，四个真实 Pi 任务已分别完成代表性业务 Bazel 测试，共享 shell 同时执行上限为 1；最低剩余磁盘 8.82 GiB、最低可用内存 37.47 GiB。该结果不代表所有服务的构建容量或四条完整告警交付链路。
 
 ## Phoenix 独立部署文件
 
@@ -66,8 +66,20 @@
 
 已在独立Python3.12.14环境安装Phoenix20.16.0与Supervisor4.3.0，并实际运行独立Supervisor实例。远端直接下载较慢，最终使用本地准备、远端离线解析通过的157个Linuxwheel安装；旧下载在替代包就绪后显式停止，未并行写同一环境。
 
-内部Phoenix和Viewer已经运行，实际采集一条合成追踪并经Viewer GraphQL读回；公开写入/认证/管理探针返回403。HTTP6006、gRPC4317仅绑定127.0.0.1；AnyDev Supervisor下Viewer8081绑定0.0.0.0供平台端口代理访问。私有key文件位于独立private目录，未进入代码仓库。两个进程用于验证，告警主进程仍STOPPED。Supervisor和systemd启动文件都会自动检查/应用gRPC本机绑定补丁。
+内部Phoenix和Viewer已经运行，实际采集一条合成追踪并经Viewer GraphQL读回；公开写入/认证/管理探针返回403。HTTP6006、gRPC4317仅绑定127.0.0.1；AnyDev Supervisor下Viewer8081绑定0.0.0.0供平台端口代理访问。私有key文件位于独立private目录，未进入代码仓库。告警主进程已启动，已接收一条真实测试群告警；任务完成和业务 MR 验收仍未通过。Supervisor和systemd启动文件都会自动检查/应用gRPC本机绑定补丁。
 
-尚未配置公开域名/TLS及宿主启动时恢复Supervisor，也未接入真实企微或业务MR；不能把本机可用称为完成公开部署或按群切换。
+公开访问结果见下文；业务 MR 全链路仍未完成，尚未按群切换。Supervisor 未配置宿主开机启动，当前验收范围为服务进程恢复。
 
 2026-09-28：AnyDev外部端口代理无法访问仅监听127.0.0.1的Viewer，调整Supervisor的HOST为0.0.0.0后，平台cloudide入口匿名GET首页和GraphQL查询均返回200；GraphQL mutation、OTLP写入和/auth/login均返回403。内部采集和管理服务继续仅绑定本机。实际域名保存在部署私有配置。
+
+Pi 0.87.1 recovery also requires the original task worktree absolute path (cwd). Session discovery matches both session ID and cwd. A relocated cwd can create an empty session with the same ID; verify recall of prior evidence, not just the returned session ID.
+
+If the authenticated WeCom text includes a leading bot mention, set `bot.mention` to that exact display text (including `@`). Intake removes only this configured prefix at a whitespace boundary before parsing Owner commands; sender/group authorization is unchanged.
+
+### 私有集成部署边界
+
+查询脚本、查询凭据、工蜂 MCP 配置、平台鉴权程序与审核结果解析器保存在新部署的 `private/` 目录，目录权限 0700、配置权限 0600；查询与 MR 桥接使用新服务自己的 Python/Node。私有适配器需单独备份和迁移，不随公开仓库发布。工蜂桥接仍使用宿主安装的工蜂 MCP CLI；迁移到新宿主时需准备该平台工具。
+
+真实只读 MR 状态读取已在最小环境中通过；尚未据此宣称新建 MR、审核触发或完整切换完成。机器人记录鉴权、断连、重连事件以及收到消息的群是否已配置，不记录消息正文或身份凭据。
+
+2026-09-28 真实恢复演练：停止测试群主服务后，备份并在原路径恢复实际任务的 8 张数据库表、2 个会话文件及业务 worktree。所有行和会话哈希一致，worktree HEAD/状态一致，覆盖已有目录被拒绝；重启后任务保持原阻塞状态。首次演练发现相对符号链接被复制为绝对链接，现已修复并验证 6 个真实链接保留。此任务尚无方案或 MR，因此尚未覆盖真实 MR 创建后的恢复。18 个私有配置及适配资产另行归档并验证文件哈希。
