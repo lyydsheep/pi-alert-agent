@@ -13,5 +13,14 @@ test('configuration rejects groups without an Owner before enabling timeout exec
     for(const groups of [{},[],{test:null},{test:{owners:[],webhook:'https://example.invalid'}},{test:{owners:[' '],webhook:'https://example.invalid'}}]){
       writeFileSync(path,JSON.stringify({...config,groups}));assert.throws(()=>loadConfig(path),/configuration/);
     }
+    writeFileSync(path,JSON.stringify({...config,delivery:{command:process.execPath,args:['bridge.mjs'],project:'project',agentReviewCheck:'review',requiredChecks:['tests']}}));
+    assert.equal('command' in loadConfig(path).delivery,true);
+    for(const delivery of [
+      {command:process.execPath,project:'project',agentReviewCheck:'review',requiredChecks:[]},
+      {command:process.execPath,args:[1],project:'project',agentReviewCheck:'review',requiredChecks:['tests']},
+      {command:process.execPath,project:'',agentReviewCheck:'review',requiredChecks:['tests']},
+      {command:null,apiEndpoint:'https://example.invalid',token:'test',project:'project',agentReviewCheck:'review',requiredChecks:['tests']},
+      {command:process.execPath,project:'project',agentReviewCheck:'review',requiredChecks:[' ']},
+    ]){writeFileSync(path,JSON.stringify({...config,delivery}));assert.throws(()=>loadConfig(path),/delivery/);}
   }finally{rmSync(root,{recursive:true,force:true});}
 });

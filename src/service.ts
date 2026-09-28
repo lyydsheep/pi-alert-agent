@@ -13,7 +13,9 @@ import { DeliveryHttpError } from './delivery.ts';
 export interface ServiceDependencies {
   runner: Pick<PiRunner,'run'>;
   git: Pick<GitWorkspaceManager,'prepare'|'push'|'head'|'cleanup'>;
-  delivery: Pick<GitLabDeliveryClient,'createOrReadMergeRequest'|'status'|'feedback'>;
+  delivery: Pick<GitLabDeliveryClient,'createOrReadMergeRequest'|'status'|'feedback'> & {
+    ensureAgentReview?: (mrIid:number,expectedHead:string,signal?:AbortSignal)=>Promise<unknown>;
+  };
   notify: (groupId:string,text:string,owners:string[])=>Promise<void>;
   trace?: (taskId:string,runId:string,event:unknown)=>void;
   now?:()=>number;
@@ -209,6 +211,13 @@ export class AlertService {
             if(!status.currentHead) {
               if(status.mergeRequest.sourceBranch!==task.branch)throw new Error('MR source branch changed unexpectedly');
               this.engine.recordMr(task.id,{url:status.mergeRequest.url,branch:status.mergeRequest.sourceBranch,headSha:status.mergeRequest.head});
+            }
+            const current=this.engine.getTask(task.id);
+            const currentMr=this.store.get<{mr_iid:number|null}>('SELECT mr_iid FROM runtime WHERE task_id=?',task.id);
+            if(this.deps.delivery.ensureAgentReview&&!status.ownerRequired&&(status.agentReviewStatus===undefined||status.agentReviewStatus==='pending')
+              &&currentMr?.mr_iid===meta.mr_iid&&current?.headSha===status.mergeRequest.head&&['awaiting_checks','delivered'].includes(current.status)) {
+              await this.deps.delivery.ensureAgentReview(meta.mr_iid,status.mergeRequest.head);
+              if(this.stopped)return;
             }
             if(status.ownerRequired) {
               // A conflict is an Owner decision, not a cue to inspect another task.

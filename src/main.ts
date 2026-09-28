@@ -4,6 +4,7 @@ import { loadConfig } from './config.ts';
 import { PiRunner } from './pi/index.ts';
 import { GitWorkspaceManager } from './git.ts';
 import { GitLabDeliveryClient } from './delivery.ts';
+import { CommandDeliveryClient } from './delivery-command.ts';
 import { AlertService } from './service.ts';
 import { incomingFrame, sendGroup } from './wecom.ts';
 import { createDashboard } from './web.ts';
@@ -17,7 +18,7 @@ const observer=config.phoenix?createObserver({endpoint:config.phoenix.endpoint,a
 const service=new AlertService(config,{
   runner:new PiRunner({agentDir:join(config.dataDir,'pi'),model:config.model,timeoutMs:config.runTimeoutMs,tools:config.tools,skills:config.skills}),
   git:new GitWorkspaceManager({repositoryPath:config.repositoryPath,worktreeRoot:join(config.dataDir,'worktrees'),targetBranch:'master'}),
-  delivery:new GitLabDeliveryClient(config.delivery),
+  delivery:'command' in config.delivery?new CommandDeliveryClient(config.delivery):new GitLabDeliveryClient(config.delivery),
   notify:async(groupId,text,owners)=>{const group=config.groups[groupId];if(!group)throw new Error('Unknown notification group');await sendGroup(group.webhook,text,owners);},
   trace:(taskId,runId,event)=>observer?.event(taskId,runId,event),
 });

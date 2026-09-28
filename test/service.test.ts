@@ -52,7 +52,7 @@ function fixture(t: TestContext, run: (input: PiRunInput) => Promise<PiRunResult
   const store = new Store(join(directory, 'state.sqlite'));
   let now = 1_000_000;
   const notifications: Array<{ groupId: string; text: string; owners: string[] }> = [];
-  const calls = { prepare: 0, push: 0, createMr: 0, status: 0, cleanup: 0 };
+  const calls = { prepare: 0, push: 0, createMr: 0, status: 0, cleanup: 0, ensureAgentReview: [] as Array<{mrIid:number;head:string}> };
   let feedback: MergeRequestFeedback[] = [];
   let deliveryStatus: DeliveryStatus = {
     mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'opened', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-1' },
@@ -72,6 +72,7 @@ function fixture(t: TestContext, run: (input: PiRunInput) => Promise<PiRunResult
     delivery: {
       createOrReadMergeRequest: async (): Promise<MergeRequest> => { calls.createMr++; return deliveryStatus.mergeRequest; },
       status: async () => { calls.status++; return deliveryStatus; },
+      ensureAgentReview: async (mrIid,head) => { calls.ensureAgentReview.push({mrIid,head}); },
       feedback: async (): Promise<MergeRequestFeedback[]> => feedback,
     },
     notify: async (groupId, text, owners) => { notifications.push({ groupId, text, owners }); },
@@ -473,3 +474,47 @@ test('workspace synchronization conflict blocks before Pi and notifies Owner',as
   assert.equal(runs,0);assert.equal(f.calls.push,0);assert.equal(f.calls.createMr,0);
   assert.ok(f.notifications.some(n=>n.owners.includes('owner')&&n.text.includes('Local changes retained')));
  });
+
+test('requests missing Agent review idempotently for each current MR head',async t=>{
+  const f=fixture(t,async input=>result(input,input.phase==='investigate'?'plan':'fixed'));
+  await f.service.receive(message('review-request-1','[告警:alerts:review-request] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('review-request-2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  f.setDeliveryStatus({
+    mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},
+    currentHead:true,agentReviewPassed:false,agentReviewStatus:'pending',mergeable:true,checks:{build:'pending'},ownerRequired:false,complete:false,
+  });
+  f.advance(30_000);await f.service.pump();
+  f.advance(30_000);await f.service.pump();
+  f.setDeliveryStatus({
+    mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-2'},
+    currentHead:false,agentReviewPassed:false,agentReviewStatus:'pending',mergeable:true,checks:{build:'pending'},ownerRequired:false,complete:false,
+  });
+  f.advance(30_000);await f.service.pump();
+  assert.deepEqual(f.calls.ensureAgentReview,[{mrIid:7,head:'head-1'},{mrIid:7,head:'head-1'},{mrIid:7,head:'head-2'}]);
+});
+
+test('does not request Agent review after a status wait pauses the task or for a closed MR',async t=>{
+  const f=fixture(t,async input=>result(input,input.phase==='investigate'?'plan':'fixed'));
+  await f.service.receive(message('review-race-1','[告警:alerts:review-race] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('review-race-2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  let release!:()=>void;let started!:()=>void;
+  const waiting=new Promise<void>(resolve=>{release=resolve;});
+  const observed=new Promise<void>(resolve=>{started=resolve;});
+  f.service.deps.delivery.status=async()=>{
+    started();await waiting;
+    return {mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},currentHead:true,agentReviewPassed:false,agentReviewStatus:'pending',mergeable:true,checks:{build:'pending'},ownerRequired:false,complete:false};
+  };
+  f.advance(30_000);const poll=f.service.pump();await observed;
+  await f.service.receive(message('review-race-3','任务 #1 暂停','owner'));release();await poll;
+  assert.equal(f.service.engine.getTask(1)?.status,'paused');
+  assert.deepEqual(f.calls.ensureAgentReview,[]);
+
+  await f.service.receive(message('review-race-4','任务 #1 恢复','owner'));
+  f.service.deps.delivery.status=async()=>({mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'closed',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},currentHead:true,agentReviewPassed:false,agentReviewStatus:'pending',mergeable:false,checks:{build:'pending'},ownerRequired:false,complete:false});
+  f.advance(30_000);await f.service.pump();
+  assert.deepEqual(f.calls.ensureAgentReview,[]);
+});

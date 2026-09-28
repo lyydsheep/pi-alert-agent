@@ -12,7 +12,8 @@ export interface Config {
   groups: Record<string, {owners:string[];webhook:string}>;
   bot: {id:string;secret:string;mention?:string};
   model: {provider:string;id:string;apiKey:string;endpoint?:string;api?:string};
-  delivery: {apiEndpoint:string;token:string;project:string;requiredChecks:string[];agentReviewCheck:string};
+  delivery: {apiEndpoint:string;token:string;project:string;requiredChecks:string[];agentReviewCheck:string;timeoutMs?:number}
+    | {command:string;args?:string[];project:string;requiredChecks:string[];agentReviewCheck:string;timeoutMs?:number};
   tools?: Record<string,{command:string;args?:string[]}>;
   skills?: string[];
   intake?: {source:string;eventIdPattern:string};
@@ -34,7 +35,11 @@ export function loadConfig(file: string): Config {
   for(const key of ['repositoryPath','dataDir'])if(typeof c[key]!=='string'||!c[key])throw new Error(`Missing ${key}`);
   if(!c.bot?.id||!c.bot?.secret||!c.model?.id||!c.model?.apiKey||!c.model?.provider)throw new Error('Bot and model configuration required');
   if(c.bot.mention!==undefined&&(typeof c.bot.mention!=='string'||!/^@[^\r\n]*\S$/.test(c.bot.mention)))throw new Error('Invalid bot mention');
-  if(!c.delivery?.apiEndpoint||!c.delivery?.token||!c.delivery?.project||!c.delivery?.agentReviewCheck||!Array.isArray(c.delivery?.requiredChecks))throw new Error('Explicit delivery/check configuration required');
+  if(!c.delivery||typeof c.delivery!=='object'||Array.isArray(c.delivery)||typeof c.delivery.project!=='string'||!c.delivery.project.trim()||typeof c.delivery.agentReviewCheck!=='string'||!c.delivery.agentReviewCheck.trim()||!Array.isArray(c.delivery.requiredChecks)||!c.delivery.requiredChecks.length||c.delivery.requiredChecks.some((x:any)=>typeof x!=='string'||!x.trim()))throw new Error('Explicit delivery/check configuration required');
+  if('command' in c.delivery){
+    if(typeof c.delivery.command!=='string'||!c.delivery.command.trim()||c.delivery.args&&(!Array.isArray(c.delivery.args)||c.delivery.args.some((x:any)=>typeof x!=='string')))throw new Error('Invalid delivery command configuration');
+  }else if(!c.delivery.apiEndpoint||!c.delivery.token)throw new Error('Explicit delivery/check configuration required');
+  if(c.delivery.timeoutMs!==undefined&&(!Number.isSafeInteger(c.delivery.timeoutMs)||c.delivery.timeoutMs<1))throw new Error('Invalid delivery timeoutMs');
   if(!c.groups||typeof c.groups!=='object'||Array.isArray(c.groups)||!Object.keys(c.groups).length)throw new Error('Group configuration required');
   for(const group of Object.values(c.groups) as any[])if(!group||!Array.isArray(group.owners)||!group.owners.length||group.owners.some((x:any)=>typeof x!=='string'||!x.trim())||typeof group.webhook!=='string'||!group.webhook)throw new Error('Invalid group configuration');
   if(c.skills&&(!Array.isArray(c.skills)||c.skills.some((x:any)=>typeof x!=='string')))throw new Error('Invalid skills paths');
