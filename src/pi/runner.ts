@@ -345,6 +345,7 @@ export class PiRunner {
         : "Execute only the authorized plan, test it, and commit the resulting code. Do not push or create an MR; the main service owns delivery. Report the actual state without claiming unverified success.",
       "Keep test artifacts in the task TMPDIR. Tests needing network listeners must bind ephemeral ports and isolated test data; never reuse another task workspace.",
       ...(this.config.tools?.shell ? ["Shell commands share a host resource slot. Respect the wrapper worker limits; for build tools that ignore its environment (for example Bazel), pass the matching worker limit explicitly. Do not detach background build processes."] : []),
+      "所有面向 Owner 的自然语言必须使用简体中文，包括 summary、background、diagnosis、evidence、scope、solution、acceptance、risks、conclusion 与 externalAction；代码、标识符、原始日志和引用保持原文。保留不确定性，不把假设写成已确认根因。",
       input.prompt,
       `Finish with exactly one result tool. ${expected} Its structured arguments are the authoritative round result.`,
     ].join("\n\n");

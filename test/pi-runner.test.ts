@@ -47,6 +47,7 @@ test("returns a structured plan and reuses a stable task session", async () => {
     assert.equal(first.runId, "run-1");
     const args = JSON.parse(await readFile(capture, "utf8")) as string[];
     assert.equal(args[args.indexOf("--session-id") + 1], first.sessionId);
+    assert.match(args.join("\n"), /简体中文/);
     assert.equal(args[args.indexOf("--skill") + 1], "/private/skills/trace");
     assert.equal(await readFile(`${capture}.tmp`, 'utf8'), join(input.sessionPath, 'tmp'));
     const models = await readFile(join(config.agentDir, "models.json"), "utf8");
