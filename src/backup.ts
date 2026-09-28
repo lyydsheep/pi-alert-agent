@@ -21,7 +21,7 @@ export async function backupData(dataDir:string,destination:string):Promise<void
     try{await sqliteBackup(db,join(destination,'tasks.sqlite'));}finally{db.close();}
     for(const item of await readdir(dataDir,{withFileTypes:true})) {
       if(item.name==='service.lock'||item.name.startsWith('tasks.sqlite'))continue;
-      await cp(join(dataDir,item.name),join(destination,item.name),{recursive:true,dereference:false,preserveTimestamps:true});
+      await cp(join(dataDir,item.name),join(destination,item.name),{recursive:true,dereference:false,verbatimSymlinks:true,preserveTimestamps:true});
     }
     await writeFile(join(destination,'backup.json'),JSON.stringify({format:1,dataDir,createdAt:new Date().toISOString(),scope:'same-host; target business repository and task refs must be retained separately'},null,2),{mode:0o600});
   } catch(error){await rm(destination,{recursive:true,force:true});throw error;}
@@ -33,5 +33,5 @@ export async function restoreData(source:string,dataDir:string):Promise<void> {
   await assertStopped(dataDir);
   // Refuse to overwrite live data. Operator archives the old directory first.
   await mkdir(dataDir,{recursive:false,mode:0o700});
-  for(const item of await readdir(source))if(item!=='backup.json')await cp(join(source,item),join(dataDir,item),{recursive:true,dereference:false,preserveTimestamps:true});
+  for(const item of await readdir(source))if(item!=='backup.json')await cp(join(source,item),join(dataDir,item),{recursive:true,dereference:false,verbatimSymlinks:true,preserveTimestamps:true});
 }
