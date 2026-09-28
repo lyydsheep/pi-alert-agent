@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { writeSync } from "node:fs";
-import { createBashToolDefinition, createLocalBashOperations } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, createLocalBashOperations, type BashToolOptions } from "@earendil-works/pi-coding-agent";
 
 type ExtensionApi = {
   registerTool(tool: Record<string, unknown>): void;
@@ -20,7 +20,7 @@ const object = (properties: Record<string, unknown>, required: string[] = []) =>
 const string = { type: "string" };
 const strings = { type: "array", items: string };
 
-type AdapterName = "source" | "logs" | "trace" | "alert";
+type AdapterName = "source" | "logs" | "trace" | "alert" | "shell";
 
 function command(name: AdapterName): { command: string; args: string[] } | undefined {
   const raw = process.env[`PI_ALERT_${name.toUpperCase()}_TOOL`];
@@ -60,13 +60,20 @@ function execute(spec: { command: string; args: string[] }, input: Record<string
 }
 
 export default function register(pi: ExtensionApi): void {
-  const bash = createBashToolDefinition(process.cwd());
+  const shell = command("shell");
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+  const options: BashToolOptions = shell ? {
+    spawnHook: (context) => ({ ...context,
+      command: [shell.command, ...shell.args, "/bin/bash", "-c", context.command].map(quote).join(" "),
+    }),
+  } : {};
+  const bash = createBashToolDefinition(process.cwd(), options);
   const operations = createLocalBashOperations();
   const outputs = new Map<string, Buffer[]>();
   pi.registerTool({ ...bash, async execute(...args: Parameters<typeof bash.execute>) {
     const chunks: Buffer[] = [];
     outputs.set(args[0], chunks);
-    const tool = createBashToolDefinition(process.cwd(), { operations: {
+    const tool = createBashToolDefinition(process.cwd(), { ...options, operations: {
       exec: (command, cwd, execution) => operations.exec(command, cwd, { ...execution,
         onData: (data) => { chunks.push(Buffer.from(data)); execution.onData(data); },
       }),

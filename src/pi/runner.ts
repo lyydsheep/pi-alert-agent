@@ -27,7 +27,7 @@ export type PiRunnerConfig = {
   killGraceMs?: number;
   /** Private or public skill files/directories loaded by Pi without copying them into this repository. */
   skills?: string[];
-  tools?: { source?: PiToolCommand; logs?: PiToolCommand; trace?: PiToolCommand; alert?: PiToolCommand };
+  tools?: { source?: PiToolCommand; logs?: PiToolCommand; trace?: PiToolCommand; alert?: PiToolCommand; shell?: PiToolCommand };
 };
 
 export type PiRunInput = {
@@ -234,6 +234,7 @@ export class PiRunner {
       ...(this.config.tools?.logs ? { PI_ALERT_LOGS_TOOL: JSON.stringify({ ...this.config.tools.logs, args: this.config.tools.logs.args ?? [] }) } : {}),
       ...(this.config.tools?.trace ? { PI_ALERT_TRACE_TOOL: JSON.stringify({ ...this.config.tools.trace, args: this.config.tools.trace.args ?? [] }) } : {}),
       ...(this.config.tools?.alert ? { PI_ALERT_ALERT_TOOL: JSON.stringify({ ...this.config.tools.alert, args: this.config.tools.alert.args ?? [] }) } : {}),
+      ...(this.config.tools?.shell ? { PI_ALERT_SHELL_TOOL: JSON.stringify({ ...this.config.tools.shell, args: this.config.tools.shell.args ?? [] }) } : {}),
       PI_ALERT_CHILD_COMMAND: this.config.command ?? process.execPath,
       PI_ALERT_CHILD_ARGS: JSON.stringify(args),
       PI_ALERT_CHILD_CWD: input.cwd,
@@ -342,6 +343,8 @@ export class PiRunner {
       input.phase === "investigate"
         ? "Investigate and validate the cause. Do not make product changes in this round."
         : "Execute only the authorized plan, test it, and commit the resulting code. Do not push or create an MR; the main service owns delivery. Report the actual state without claiming unverified success.",
+      "Keep test artifacts in the task TMPDIR. Tests needing network listeners must bind ephemeral ports and isolated test data; never reuse another task workspace.",
+      ...(this.config.tools?.shell ? ["Shell commands share a host resource slot. Respect the wrapper worker limits; for build tools that ignore its environment (for example Bazel), pass the matching worker limit explicitly. Do not detach background build processes."] : []),
       input.prompt,
       `Finish with exactly one result tool. ${expected} Its structured arguments are the authoritative round result.`,
     ].join("\n\n");

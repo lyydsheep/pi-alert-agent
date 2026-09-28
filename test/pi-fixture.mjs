@@ -19,6 +19,7 @@ if (prompt.includes("[invalid-json]")) {
 } else {
   if (capture) await writeFile(capture, JSON.stringify(args));
   if (capture) await writeFile(`${capture}.tmp`, process.env.TMPDIR ?? '');
+  if (capture) await writeFile(`${capture}.shell`, process.env.PI_ALERT_SHELL_TOOL ?? 'null');
   let evidence = ["fixture evidence"];
   if (prompt.includes("adapter-trace")) {
     const extension = await import(value("--extension"));

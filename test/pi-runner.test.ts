@@ -107,11 +107,12 @@ test("supports no-code investigation completion and expanded execution plans", a
 });
 
 test("passes trace IDs to a configured private CLI adapter", async () => {
-  const { root, runner } = await setup({ tools: { trace: { command: process.execPath, args: [adapter] } } });
+  const { root, runner } = await setup({ tools: { trace: { command: process.execPath, args: [adapter] }, shell: { command: "/bin/bash", args: ["configured-wrapper", "shared-lock", "2"] } } });
   try {
     const result = await runner.run({ taskId: "task-3", runId: "run-3", cwd: root, sessionPath: join(root, "sessions"), prompt: "adapter-trace", phase: "investigate" });
     assert.equal(result.status, "plan");
     assert.deepEqual(result.plan.evidence, ["trace:trace-123"]);
+    assert.deepEqual(JSON.parse(await readFile(join(root,"args.json.shell"),"utf8")),{command:"/bin/bash",args:["configured-wrapper","shared-lock","2"]});
   } finally {
     await rm(root, { recursive: true, force: true });
   }
