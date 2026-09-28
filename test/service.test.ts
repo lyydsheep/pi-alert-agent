@@ -6,7 +6,7 @@ import test, { type TestContext } from 'node:test';
 
 import type { Config } from '../src/config.ts';
 import type { DeliveryStatus, MergeRequest, MergeRequestFeedback } from '../src/delivery.ts';
-import type { GitWorkspace, PushResult } from '../src/git.ts';
+import { GitWorkspaceConflictError, type GitWorkspace, type PushResult } from '../src/git.ts';
 import type { PiRunInput, PiRunResult } from '../src/pi/index.ts';
 import { AlertService, type ServiceDependencies } from '../src/service.ts';
 import { Store } from '../src/store.ts';
@@ -261,7 +261,10 @@ test('rolls task intake back when the inbox receipt cannot be recorded', async (
 
 test('remote HEAD and failed Agent review invalidate delivery and schedule retry', async (t) => {
   const phases: string[] = [];
+  const expectedHeads: Array<string|undefined> = [];
   const f = fixture(t, async (input) => { phases.push(input.phase); return result(input, input.phase === 'investigate' ? 'plan' : 'fixed'); });
+  const prepare=f.service.deps.git.prepare;
+  f.service.deps.git.prepare=async (...args)=>{expectedHeads.push(args[3]);return prepare(...args);};
   await f.service.receive(message('m1', '[告警:alerts:head-change] down'));
   await f.service.pump();
   await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
@@ -297,6 +300,7 @@ test('remote HEAD and failed Agent review invalidate delivery and schedule retry
   await eventually(() => phases.length === 3, 'Agent review retry run');
   await eventually(() => f.service.active.size === 0, 'Agent review retry completion');
   assert.equal(phases[2], 'execute');
+  assert.deepEqual(expectedHeads,[undefined,undefined,'head-2']);
 });
 
 test('preserves actionable review feedback and supplies it to the next runner', async (t) => {
@@ -457,3 +461,15 @@ test('rewritten model evidence alone cannot evade the three-round no-progress bl
   assert.equal(f.service.engine.getTask(1)?.status,'blocked');
   assert.equal(f.service.engine.getTask(1)?.noProgress,3);
 });
+
+test('workspace synchronization conflict blocks before Pi and notifies Owner',async t=>{
+  let runs=0;
+  const f=fixture(t,async input=>{runs++;return result(input,'plan');});
+  f.service.deps.git.prepare=async()=>{throw new GitWorkspaceConflictError('Local changes retained; Owner must reconcile the MR branch');};
+  await f.service.receive(message('sync-conflict','[告警:alerts:sync-conflict] down'));
+  await f.service.pump();
+  await eventually(()=>f.service.engine.getTask(1)?.status==='blocked','workspace conflict');
+  await f.service.pump();
+  assert.equal(runs,0);assert.equal(f.calls.push,0);assert.equal(f.calls.createMr,0);
+  assert.ok(f.notifications.some(n=>n.owners.includes('owner')&&n.text.includes('Local changes retained')));
+ });

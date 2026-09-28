@@ -6,7 +6,7 @@ import { Store } from './store.ts';
 import { commandFrom, eventFrom, targetFrom, type IncomingMessage } from './wecom.ts';
 import type { Config } from './config.ts';
 import type { PiRunner } from './pi/index.ts';
-import type { GitWorkspaceManager, GitWorkspace } from './git.ts';
+import { GitWorkspaceConflictError, type GitWorkspaceManager, type GitWorkspace } from './git.ts';
 import type { GitLabDeliveryClient } from './delivery.ts';
 import { DeliveryHttpError } from './delivery.ts';
 
@@ -140,7 +140,7 @@ export class AlertService {
     const identity={taskId:task.id,runId:String(effect.payload.runId),fence:Number(effect.payload.fence),planVersion:Number(effect.payload.planVersion)};
     const valid=()=>{const current=this.engine.getTask(task.id);return !signal.aborted&&current?.status==='running'&&current.runId===identity.runId&&current.runFence===identity.fence&&current.planVersion===identity.planVersion;};
     try {
-      const workspace=await this.deps.git.prepare(String(task.id),'fix',signal);
+      const workspace=await this.deps.git.prepare(String(task.id),'fix',signal,task.headSha??undefined);
       if(!valid())return;
       this.store.run('INSERT INTO runtime(task_id,workspace) VALUES(?,?) ON CONFLICT(task_id) DO UPDATE SET workspace=excluded.workspace',task.id,JSON.stringify(workspace));
       const fixing=effect.payload.phase==='fix';
@@ -188,7 +188,7 @@ export class AlertService {
         if(!recorded.accepted)return;
       }
     } catch(error) {
-      if(valid())this.engine.completeRun({...identity,progress:false,next:error instanceof DeliveryHttpError&&[401,403,404].includes(error.status)?'blocked':'ready',reason:error instanceof Error?error.message:'Execution failed'});
+      if(valid())this.engine.completeRun({...identity,progress:false,next:error instanceof GitWorkspaceConflictError||(error instanceof DeliveryHttpError&&[401,403,404].includes(error.status))?'blocked':'ready',reason:error instanceof Error?error.message:'Execution failed'});
       this.deps.trace?.(String(task.id),identity.runId,{type:'run_error',error:error instanceof Error?error.message:'Execution failed'});
     } finally {
       this.deps.trace?.(String(task.id),identity.runId,{type:'run_end',cancelled:signal.aborted});
