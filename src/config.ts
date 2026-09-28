@@ -10,7 +10,7 @@ export interface Config {
   runTimeoutMs: number;
   repositoryPath: string;
   groups: Record<string, {owners:string[];webhook:string}>;
-  bot: {id:string;secret:string};
+  bot: {id:string;secret:string;mention?:string};
   model: {provider:string;id:string;apiKey:string;endpoint?:string;api?:string};
   delivery: {apiEndpoint:string;token:string;project:string;requiredChecks:string[];agentReviewCheck:string};
   tools?: Record<string,{command:string;args?:string[]}>;
@@ -33,6 +33,7 @@ export function loadConfig(file: string): Config {
   const c=expand(raw);
   for(const key of ['repositoryPath','dataDir'])if(typeof c[key]!=='string'||!c[key])throw new Error(`Missing ${key}`);
   if(!c.bot?.id||!c.bot?.secret||!c.model?.id||!c.model?.apiKey||!c.model?.provider)throw new Error('Bot and model configuration required');
+  if(c.bot.mention!==undefined&&(typeof c.bot.mention!=='string'||!/^@[^\r\n]*\S$/.test(c.bot.mention)))throw new Error('Invalid bot mention');
   if(!c.delivery?.apiEndpoint||!c.delivery?.token||!c.delivery?.project||!c.delivery?.agentReviewCheck||!Array.isArray(c.delivery?.requiredChecks))throw new Error('Explicit delivery/check configuration required');
   if(!c.groups||typeof c.groups!=='object'||Array.isArray(c.groups)||!Object.keys(c.groups).length)throw new Error('Group configuration required');
   for(const group of Object.values(c.groups) as any[])if(!group||!Array.isArray(group.owners)||!group.owners.length||group.owners.some((x:any)=>typeof x!=='string'||!x.trim())||typeof group.webhook!=='string'||!group.webhook)throw new Error('Invalid group configuration');

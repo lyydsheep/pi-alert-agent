@@ -13,3 +13,15 @@ test('authenticated origin, quoted plan and exact intent remain separate', () =>
   assert.equal(eventFrom({...message,text:'similar service failed'}), undefined);
   assert.notEqual(eventFrom({...message,text:'排查 故障'})?.eventId, eventFrom({...message,messageId:'m2',text:'排查 故障'})?.eventId);
 });
+
+test('removes only the configured leading bot mention before parsing Owner commands', () => {
+  const message = (text:string) => incomingFrame({body:{chattype:'group',msgtype:'text',chatid:'g',msgid:'m',from:{userid:'u'},text:{content:text}}}, '@Test Agent');
+  for (const separator of [' ', '\n']) {
+    const received = message(`@Test Agent${separator}任务 #1 重试`);
+    assert.equal(commandFrom(received.text), 'resume');
+    assert.deepEqual(targetFrom(received), {taskId:1});
+    assert.equal(received.senderId, 'u');
+  }
+  assert.equal(commandFrom(message('@Other Agent\n任务 #1 重试').text), undefined);
+  assert.equal(commandFrom(message('@Test AgentExtra\n任务 #1 重试').text), undefined);
+});

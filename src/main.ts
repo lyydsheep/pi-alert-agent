@@ -28,7 +28,12 @@ const bot=new AiBot.WSClient({botId:config.bot.id,secret:config.bot.secret,maxRe
   logger:{debug:()=>{},info:()=>{},warn:(message:string)=>console.warn(message),error:(message:string)=>console.error(message)}});
 // Serialize inbound mutations; model work remains independently concurrent.
 let inbound:Promise<void>=Promise.resolve();
-bot.on('message.text',frame=>{inbound=inbound.then(()=>service.receive(incomingFrame(frame))).catch(error=>console.error('Inbound processing failed:',error instanceof Error?error.message:'unknown'));});
+bot.on('message.text',frame=>{inbound=inbound.then(async()=>{
+  const message=incomingFrame(frame,config.bot.mention);
+  console.log('Bot text received:',JSON.stringify({configuredGroup:!!config.groups[message.groupId]}));
+  await service.receive(message);
+}).catch(error=>console.error('Inbound processing failed:',error instanceof Error?error.message:'unknown'));});
+for(const event of ['authenticated','disconnected','reconnecting'] as const)bot.on(event,()=>console.log(new Date().toISOString(),`Bot ${event}`));
 bot.on('error',error=>console.error('Bot connection error:',error instanceof Error?error.message:'unknown'));
 bot.connect();
 const interval=setInterval(()=>void service.pump().catch(error=>console.error('Scheduler failed:',error instanceof Error?error.message:'unknown')),1000);

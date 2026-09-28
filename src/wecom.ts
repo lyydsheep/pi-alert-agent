@@ -6,15 +6,19 @@ export interface IncomingMessage {
 export type OwnerCommand = 'approve' | 'defer' | 'pause' | 'reject' | 'resume' | 'unknown' | 'confirm';
 
 // Only call with a frame received on the authenticated bot connection.
-export function incomingFrame(frame: unknown): IncomingMessage {
+export function incomingFrame(frame: unknown, botMention?: string): IncomingMessage {
   const body = (frame as { body?: Record<string, any> })?.body;
   if (!body || body.chattype !== 'group' || body.msgtype !== 'text' ||
       typeof body.chatid !== 'string' || !body.chatid ||
       typeof body.msgid !== 'string' || !body.msgid ||
       typeof body.from?.userid !== 'string' || !body.from.userid ||
       typeof body.text?.content !== 'string') throw new Error('Unsupported or incomplete authenticated message');
+  let text = body.text.content.trimStart();
+  if (botMention && text.startsWith(botMention) && (text.length === botMention.length || /^\s/.test(text.slice(botMention.length)))) {
+    text = text.slice(botMention.length).trimStart();
+  }
   return { messageId: body.msgid, groupId: body.chatid, senderId: body.from.userid,
-    text: body.text.content, quote: typeof body.quote?.text?.content === 'string' ? body.quote.text.content : '' };
+    text, quote: typeof body.quote?.text?.content === 'string' ? body.quote.text.content : '' };
 }
 
 export function commandFrom(text: string): OwnerCommand | undefined {
