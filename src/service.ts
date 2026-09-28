@@ -41,7 +41,8 @@ export class AlertService {
     this.engine=new Engine(this.store,{ownersByGroup:Object.fromEntries(Object.entries(config.groups).map(([id,g])=>[id,g.owners])),concurrency:config.concurrency,waitMs:config.waitMs,runTimeoutMs:config.runTimeoutMs,now:this.now});
     this.store.db.exec(`CREATE TABLE IF NOT EXISTS inbox (message_id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS runtime (task_id INTEGER PRIMARY KEY, workspace TEXT, mr_iid INTEGER, feedback_id INTEGER NOT NULL DEFAULT 0, progress_key TEXT);
-      CREATE TABLE IF NOT EXISTS effect_retry (effect_id INTEGER PRIMARY KEY, next_at INTEGER NOT NULL, attempts INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS effect_retry (effect_id INTEGER PRIMARY KEY, next_at INTEGER NOT NULL, attempts INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS progress_observations (task_id INTEGER NOT NULL REFERENCES tasks(id), fingerprint TEXT NOT NULL, PRIMARY KEY(task_id,fingerprint));`);
   }
 
   async receive(message:IncomingMessage):Promise<void> {
@@ -163,18 +164,28 @@ export class AlertService {
         onEvent:event=>{
           if(event&&typeof event==='object') {
             const tool=event as Record<string,unknown>;
-            if(tool.type==='tool_execution_end'&&!tool.isError&&typeof tool.toolName==='string'&&!tool.toolName.startsWith('submit_'))observations.add(createHash('sha256').update(JSON.stringify([tool.toolName,tool.result])).digest('hex'));
+            if(tool.type==='tool_execution_end'&&!tool.isError&&typeof tool.toolName==='string'&&!tool.toolName.startsWith('submit_')) {
+              const output=tool.result as {content?:unknown;details?:{fullOutput?:unknown}}|undefined;
+              const evidence=typeof output?.details?.fullOutput==='string'?output.details.fullOutput:output?.content;
+              if(evidence!==undefined)observations.add(createHash('sha256').update(JSON.stringify([tool.toolName,evidence])).digest('hex'));
+            }
           }
           this.deps.trace?.(String(task.id),identity.runId,event);
         }});
       if(!valid())return;
       const actualHead=await this.deps.git.head(workspace.path);
       if(!valid())return;
-      // Count observed tool results and Git state, not the model's rewritten evidence prose.
-      const progressKey=createHash('sha256').update(JSON.stringify({head:actualHead,evidence:[...observations].sort()})).digest('hex');
-      const prior=this.store.get<{progress_key:string|null}>('SELECT progress_key FROM runtime WHERE task_id=?',task.id)?.progress_key;
-      const progress=progressKey!==prior&&(observations.size>0||actualHead!==workspace.head);
-      this.store.run('UPDATE runtime SET progress_key=? WHERE task_id=?',progressKey,task.id);
+      // ponytail: exact evidence deduplication; semantic relevance still relies on the executor's investigation.
+      // Persist the task's whole history, excluding transport metadata such as timing and temporary output paths.
+      const progress=this.store.transaction(()=>{
+        this.store.run('INSERT OR IGNORE INTO progress_observations VALUES(?,?)',task.id,`head:${workspace.head}`);
+        if(actualHead!==workspace.head)observations.add(`head:${actualHead}`);
+        let fresh=false;
+        for(const fingerprint of observations) {
+          if(this.store.run('INSERT OR IGNORE INTO progress_observations VALUES(?,?)',task.id,fingerprint).changes)fresh=true;
+        }
+        return fresh;
+      });
       if('plan' in result) {
         this.engine.completeRun({...identity,progress,next:'plan',plan:{body:JSON.stringify(result.plan,null,2)}});
       } else if(result.completion.externalAction && !result.completion.noCodeChange) {

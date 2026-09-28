@@ -539,3 +539,25 @@ test('shutdown cancels and drains delivery polling before the caller can close t
   assert.equal(stopped,true);assert.equal(f.service.engine.getTask(1)?.status,'awaiting_checks');
   assert.deepEqual(f.calls.ensureAgentReview,[]);
 });
+
+test('alternating known tool results and metadata changes do not reset progress after restart',async t=>{
+  let rounds=0;
+  const f=fixture(t,async input=>{
+    input.onEvent?.({type:'tool_execution_end',toolName:'bash',isError:false,result:{content:[{type:'text',text:++rounds===4?'new evidence C':rounds%2?'known A':'known B'}],details:{durationMs:rounds,fullOutputPath:`/tmp/output-${rounds}`}}});
+    return result(input,input.phase==='investigate'?'plan':'fixed');
+  });
+  const status=f.service.deps.delivery.status;
+  f.service.deps.delivery.status=async(...args)=>({...await status(...args),agentReviewPassed:false,agentReviewStatus:'failed',complete:false});
+  await f.service.receive(message('novelty1','[告警:alerts:novelty] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('novelty2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  for(let attempt=0;attempt<5;attempt++){
+    if(attempt===2){await f.service.shutdown();f.service=new AlertService(f.service.config,f.service.deps,f.store);}
+    f.advance(30_000);await f.service.pump();await f.service.pump();
+    await eventually(()=>['awaiting_checks','blocked'].includes(f.service.engine.getTask(1)!.status),'repeat result');
+    assert.equal(f.service.engine.getTask(1)?.noProgress,[1,0,1,2,3][attempt]);
+  }
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  assert.equal(f.service.engine.getTask(1)?.noProgress,3);
+});
