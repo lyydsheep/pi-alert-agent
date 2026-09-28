@@ -8,6 +8,7 @@ import type { Config } from './config.ts';
 import type { PiRunner } from './pi/index.ts';
 import { GitWorkspaceConflictError, type GitWorkspaceManager, type GitWorkspace } from './git.ts';
 import type { GitLabDeliveryClient } from './delivery.ts';
+import { loadReport, reportSummary, reportUrl, statusLabel, parseReport } from './report.ts';
 import { DeliveryHttpError } from './delivery.ts';
 
 export interface ServiceDependencies {
@@ -66,14 +67,14 @@ export class AlertService {
       else if(task.groupId!==message.groupId||!task.ownerIds.includes(message.senderId))result='仅任务所属群配置的 Owner 可以操作该任务。';
       else if(/(?:^|\s)(?:补充|信息|information)\s+\S/i.test(message.text)) {
         const response=this.engine.ownerInformation({taskId:task.id,groupId:message.groupId,senderId:message.senderId,text:message.text});
-        result=`任务 #${task.id}：${response.accepted?'已保存补充信息，状态：'+response.task.status:'当前任务不接受补充信息'}。`;
+        result=`任务 #${task.id}：${response.accepted?'已保存补充信息，状态：'+statusLabel(response.task.status):'当前任务不接受补充信息'}。`;
       }
       else if(command==='confirm') {
         const response=this.engine.confirmNoCode({taskId:task.id,groupId:message.groupId,senderId:message.senderId});
         result=`任务 #${task.id}：${response.accepted?'已确认无需代码修复并关闭':'当前任务不等待关闭确认'}。`;
       } else {
         const response=this.engine.ownerCommand({taskId:task.id,planVersion:explicit?.planVersion??task.planVersion,groupId:message.groupId,senderId:message.senderId,command:command??'unknown'});
-        result=`任务 #${task.id}：${response.accepted?response.task.status:`指令未执行（${response.reason}）`}。`;
+        result=`任务 #${task.id}：${response.accepted?statusLabel(response.task.status):`指令未执行（${response.reason}）`}。`;
       }
     }
     this.store.run('INSERT OR IGNORE INTO inbox(message_id,received_at) VALUES(?,?)',inboxKey,this.now());
@@ -127,11 +128,13 @@ export class AlertService {
     const marker=`[告警方案:${task.id}:${version}]`;
     if(effect.type==='notify_plan') {
       if(task.planVersion!==version||!['plan_notify_pending','needs_owner'].includes(task.status))return true;
-      await this.deps.notify(task.groupId,`${marker}\n${task.plan?.body??''}\n请回复同意、等一下、暂停或拒绝。首次通知后30分钟提醒，再等待30分钟仍无回复则执行。若涉及其他服务，请联系对应 Owner 共同查看。`,task.ownerIds);
+      const link=reportUrl(task,this.config.dashboardUrl);
+      const report=link?`${reportSummary(loadReport(task,this.config.dataDir))}\n完整报告：${link}`:task.plan?.body??'';
+      await this.deps.notify(task.groupId,`${marker}\n${report}\n请在本群 ${this.config.bot.mention??'@机器人'} 回复同意、等一下、暂停或拒绝。通知后30分钟提醒，再等30分钟无回复则执行。涉及其他服务时，请联系对应 Owner 共同查看。`,task.ownerIds);
       this.engine.recordNotification(task.id,version,'plan',true);
     } else if(effect.type==='send_reminder') {
       if(task.planVersion!==version||task.status!=='reminder_pending')return true;
-      await this.deps.notify(task.groupId,`${marker}\n提醒：预计 ${new Date(this.now()+this.config.waitMs).toISOString()} 开始修复。回复同意、等一下、暂停或拒绝。`,task.ownerIds);
+      await this.deps.notify(task.groupId,`${marker}\n提醒：预计 ${new Date(this.now()+this.config.waitMs).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai',hour12:false})}（北京时间）开始修复。回复同意、等一下、暂停或拒绝。\n${reportUrl(task,this.config.dashboardUrl)??''}`,task.ownerIds);
       this.engine.recordNotification(task.id,version,'reminder',true);
     } else if(effect.type==='notify_mr') {
       if(task.mrUrl!==effect.payload.mrUrl||task.headSha!==effect.payload.headSha)return true;
@@ -143,10 +146,14 @@ export class AlertService {
       if(effect.type==='notify_blocked') {
         const mention=this.config.bot.mention??'@机器人';
         const details=[effect.payload.reason??task.blockReason??'需要人工处理',effect.payload.conclusion,task.mrUrl].filter(Boolean).join('\n');
-        await this.deps.notify(task.groupId,`任务 #${task.id} 需要 Owner 介入\n原因：${details}\n连续无进展轮次：${task.noProgress}。任务已阻塞，等待处理。\n请先处理上述问题，再在本群 ${mention} 发送“任务 #${task.id} 重试”；也可发送“任务 #${task.id} 补充 具体信息”。`,task.ownerIds);
+        const link=reportUrl(task,this.config.dashboardUrl);
+        const detailText=link?`${reportSummary({diagnosis:details})}\n完整报告：${link}`:details;
+        await this.deps.notify(task.groupId,`任务 #${task.id} 需要 Owner 介入\n原因：${detailText}\n连续无进展轮次：${task.noProgress}。任务已阻塞，等待处理。\n请先处理上述问题，再在本群 ${mention} 发送“任务 #${task.id} 重试”；也可发送“任务 #${task.id} 补充 具体信息”。`,task.ownerIds);
       } else {
         const title=effect.type==='notify_no_code'?'无需代码修复，请回复“确认关闭”':'修复交付完成（不代表线上恢复）';
-        await this.deps.notify(task.groupId,`任务 #${task.id} ${title}\n${JSON.stringify(effect.payload,null,2)}`,task.ownerIds);
+        const link=reportUrl(task,this.config.dashboardUrl);
+        const details=link?`${reportSummary(parseReport(task.conclusion??JSON.stringify(effect.payload)))}\n完整报告：${link}`:JSON.stringify(effect.payload,null,2);
+        await this.deps.notify(task.groupId,`任务 #${task.id} ${title}\n${details}`,task.ownerIds);
       }
     }
     return true;
@@ -219,7 +226,7 @@ export class AlertService {
         return fresh;
       });
       if('plan' in result) {
-        this.engine.completeRun({...identity,progress,next:'plan',plan:{body:JSON.stringify(result.plan,null,2)}});
+        this.engine.completeRun({...identity,progress,next:'plan',plan:{body:JSON.stringify({...result.plan,summary:result.summary},null,2)}});
       } else if(result.completion.externalAction && !result.completion.noCodeChange) {
         this.engine.completeRun({...identity,progress,next:'blocked',reason:JSON.stringify(result.completion,null,2)});
       } else if(result.completion.noCodeChange) {

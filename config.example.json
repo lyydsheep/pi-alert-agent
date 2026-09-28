@@ -3,6 +3,7 @@
   "repositoryPath": "/absolute/path/to/business-repository",
   "host": "127.0.0.1",
   "port": 8080,
+  "dashboardUrl": "https://alerts.example.com/",
   "concurrency": 4,
   "waitMs": 1800000,
   "runTimeoutMs": 3600000,

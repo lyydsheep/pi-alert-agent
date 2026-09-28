@@ -10,6 +10,8 @@ test('configuration rejects groups without an Owner before enabling timeout exec
   const config={dataDir:root,repositoryPath:root,bot:{id:'test',secret:'test'},model:{id:'test',provider:'test',apiKey:'test'},delivery:{apiEndpoint:'https://example.invalid',token:'test',project:'test',agentReviewCheck:'review',requiredChecks:['tests']},groups:{test:{owners:['owner'],webhook:'https://example.invalid'}}};
   try{
     writeFileSync(path,JSON.stringify(config));assert.equal(loadConfig(path).concurrency,4);
+    for(const dashboardUrl of ['javascript:alert(1)','https://user:secret@alerts.test','https://alerts.test/?token=bad']){writeFileSync(path,JSON.stringify({...config,dashboardUrl}));assert.throws(()=>loadConfig(path));}
+    writeFileSync(path,JSON.stringify({...config,dashboardUrl:'https://alerts.test/'}));assert.equal(loadConfig(path).dashboardUrl,'https://alerts.test/');
     for(const groups of [{},[],{test:null},{test:{owners:[],webhook:'https://example.invalid'}},{test:{owners:[' '],webhook:'https://example.invalid'}}]){
       writeFileSync(path,JSON.stringify({...config,groups}));assert.throws(()=>loadConfig(path),/configuration/);
     }

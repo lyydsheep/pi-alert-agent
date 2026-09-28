@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 export interface Config {
   dataDir: string;
   host: string;
+  dashboardUrl?: string;
   port: number;
   concurrency: number;
   waitMs: number;
@@ -44,6 +45,7 @@ export function loadConfig(file: string): Config {
   for(const group of Object.values(c.groups) as any[])if(!group||!Array.isArray(group.owners)||!group.owners.length||group.owners.some((x:any)=>typeof x!=='string'||!x.trim())||typeof group.webhook!=='string'||!group.webhook)throw new Error('Invalid group configuration');
   if(c.skills&&(!Array.isArray(c.skills)||c.skills.some((x:any)=>typeof x!=='string')))throw new Error('Invalid skills paths');
   if(c.intake){if(typeof c.intake.source!=='string'||typeof c.intake.eventIdPattern!=='string')throw new Error('Invalid intake config');new RegExp(c.intake.eventIdPattern);}
+  if(c.dashboardUrl!==undefined){const url=new URL(c.dashboardUrl);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('Invalid dashboardUrl');}
   c.dataDir=resolve(c.dataDir);c.repositoryPath=resolve(c.repositoryPath);
   c.host??='127.0.0.1';c.port??=8080;c.concurrency??=4;c.waitMs??=1_800_000;c.runTimeoutMs??=3_600_000;
   for(const key of ['port','concurrency','waitMs','runTimeoutMs'])if(!Number.isSafeInteger(c[key])||c[key]<1)throw new Error(`Invalid ${key}`);

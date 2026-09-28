@@ -7,6 +7,7 @@ import { GitLabDeliveryClient } from './delivery.ts';
 import { CommandDeliveryClient } from './delivery-command.ts';
 import { AlertService } from './service.ts';
 import { incomingFrame, sendGroup } from './wecom.ts';
+import { loadReport } from './report.ts';
 import { createDashboard } from './web.ts';
 import { createObserver } from './observability.ts';
 import { acquireServiceLock } from './lock.ts';
@@ -23,7 +24,7 @@ const service=new AlertService(config,{
   trace:(taskId,runId,event)=>observer?.event(taskId,runId,event),
 });
 service.engine.recoverRuns();
-const web=createDashboard(()=>service.engine.listTasks(),{phoenixUrl:config.phoenix?.publicUrl});
+const web=createDashboard(()=>service.engine.listTasks(),{phoenixUrl:config.phoenix?.publicUrl,getReport:task=>loadReport(task,config.dataDir)});
 await new Promise<void>((resolve,reject)=>{web.once('error',reject);web.listen(config.port,config.host,resolve);});
 const bot=new AiBot.WSClient({botId:config.bot.id,secret:config.bot.secret,maxReconnectAttempts:-1,
   logger:{debug:()=>{},info:()=>{},warn:(message:string)=>console.warn(message),error:(message:string)=>console.error(message)}});

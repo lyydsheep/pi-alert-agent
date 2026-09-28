@@ -643,3 +643,22 @@ test('blocked task proactively mentions Owner with retry instructions and retrie
   await f.service.pump();
   assert.equal(f.notifications.filter(n=>n.text.includes('需要 Owner 介入')).length,1);
 });
+
+
+test('configured report URL keeps plan notifications short and pins the notified version',async t=>{
+  const f=fixture(t,async input=>{
+    assert.match(input.prompt,/任务 #1/);
+    const value=result(input,'plan');
+    if(value.status==='plan'){value.summary='初步发现下游超时，根因尚待验证。';value.plan.diagnosis='已发现待验证的下游超时。'.repeat(100);value.plan.evidence=['私有详细证据不应塞入群消息'];}
+    return value;
+  });
+  f.service.config.dashboardUrl='https://alerts.test/';
+  await f.service.receive(message('report-plan','[告警:alerts:report-plan] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');await f.service.pump();
+  const notice=f.notifications.find(n=>n.text.includes('[告警方案:1:1]'))!;
+  assert.ok(notice.text.includes('https://alerts.test/tasks/1?version=1'));
+  assert.ok(notice.text.includes('初步发现下游超时，根因尚待验证。'));
+  assert.ok(!notice.text.includes('私有详细证据不应塞入群消息'));
+  assert.ok(Buffer.byteLength(notice.text)<1800);assert.deepEqual(notice.owners,['owner']);
+  assert.equal(f.service.engine.getTask(1)?.status,'awaiting_owner');
+});
