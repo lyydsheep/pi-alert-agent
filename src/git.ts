@@ -73,7 +73,7 @@ export class GitWorkspaceManager {
     this.worktreeRoot = resolve(options.worktreeRoot);
     this.remote = options.remote ?? 'origin';
     this.targetBranch = options.targetBranch ?? 'master';
-    this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.timeoutMs = options.timeoutMs ?? 300_000;
   }
 
   async prepare(taskId: string, kind: 'fix' | 'feat' = 'fix', signal?: AbortSignal): Promise<GitWorkspace> {
