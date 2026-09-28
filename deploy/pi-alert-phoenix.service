@@ -1,0 +1,16 @@
+[Unit]
+Description=Private Phoenix collector for Pi alert Agent
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/data/workspace/pi-alert-agent-validation/private/phoenix.env
+ExecStartPre=/data/workspace/pi-alert-agent-validation/phoenix-runtime/bin/python /data/workspace/pi-alert-agent-validation/app/scripts/patch-phoenix-bind.py
+ExecStart=/data/workspace/pi-alert-agent-validation/phoenix-runtime/bin/python -m phoenix.server.main serve
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

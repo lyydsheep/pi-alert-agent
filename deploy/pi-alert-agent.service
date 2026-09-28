@@ -1,0 +1,19 @@
+[Unit]
+Description=Pi alert Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/workspace/pi-alert-agent-validation/app
+EnvironmentFile=/data/workspace/pi-alert-agent-validation/private/runtime.env
+Environment=PATH=/data/workspace/pi-alert-agent-validation/runtime/node_modules/node/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/data/workspace/pi-alert-agent-validation/runtime/node_modules/node/bin/node src/main.ts /data/workspace/pi-alert-agent-validation/private/config.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

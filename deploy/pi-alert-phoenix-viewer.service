@@ -1,0 +1,18 @@
+[Unit]
+Description=Read-only Phoenix viewer gateway
+After=pi-alert-phoenix.service
+
+[Service]
+Type=simple
+WorkingDirectory=/data/workspace/pi-alert-agent-validation/app
+EnvironmentFile=/data/workspace/pi-alert-agent-validation/private/phoenix-viewer.env
+Environment=PHOENIX_INTERNAL_URL=http://127.0.0.1:6006
+Environment=HOST=127.0.0.1
+Environment=PORT=8081
+ExecStart=/data/workspace/pi-alert-agent-validation/runtime/node_modules/node/bin/node src/phoenix-public.ts
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
