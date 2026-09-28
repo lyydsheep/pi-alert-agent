@@ -410,7 +410,7 @@ test('blocks when MR recovery finds only a closed MR', async (t) => {
   await eventually(() => f.service.engine.getTask(1)?.status === 'blocked', 'closed MR block');
   await f.service.pump();
   assert.match(f.service.engine.getTask(1)!.blockReason!, /closed/);
-  assert.ok(f.notifications.some((notice) => notice.text.includes('任务阻塞')));
+  assert.ok(f.notifications.some((notice) => notice.text.includes('需要 Owner 介入')));
   assert.deepEqual(phases, ['investigate', 'execute']);
 });
 
@@ -614,4 +614,32 @@ test('a confirmed late push updates an existing MR head without resuming the pau
   assert.equal(paused.status,'paused');assert.equal(paused.headSha,'head-2');assert.equal(paused.mrUrl,'https://git.test/mr/7');
   assert.equal(f.calls.createMr,1);assert.deepEqual(f.calls.ensureAgentReview,[]);
   assert.ok(f.notifications.some(n=>n.text.includes('已确认推送：head-2')&&n.text.includes('保留已有 MR')));
+});
+
+
+test('blocked task proactively mentions Owner with retry instructions and retries a failed notification',async t=>{
+  const f=fixture(t,async()=>{throw new Error('Pi emitted invalid JSON');});
+  f.service.config.bot.mention='@Test Agent';
+  const notify=f.service.deps.notify;let rejected=false;
+  f.service.deps.notify=async(group,text,owners)=>{
+    if(text.includes('需要 Owner 介入')&&!rejected){rejected=true;throw new Error('notification unavailable');}
+    await notify(group,text,owners);
+  };
+  await f.service.receive(message('blocked-owner','[告警:alerts:blocked-owner] down'));
+  for(let attempt=0;attempt<3;attempt++){
+    await f.service.pump();
+    await eventually(()=>f.service.active.size===0,'failed executor stopped');
+  }
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  await f.service.pump();
+  assert.equal(rejected,true);
+  assert.ok(f.service.engine.outbox().some(e=>e.type==='notify_blocked'));
+  f.advance(3_000);await f.service.pump();
+  const notice=f.notifications.find(n=>n.text.includes('需要 Owner 介入'));
+  assert.ok(notice);assert.equal(notice.groupId,'group');assert.deepEqual(notice.owners,['owner']);
+  assert.match(notice.text,/Pi emitted invalid JSON/);assert.match(notice.text,/连续无进展轮次：3/);
+  assert.match(notice.text,/@Test Agent 发送“任务 #1 重试”/);assert.match(notice.text,/任务 #1 补充 具体信息/);
+  assert.equal(f.service.engine.outbox().some(e=>e.type==='notify_blocked'),false);
+  await f.service.pump();
+  assert.equal(f.notifications.filter(n=>n.text.includes('需要 Owner 介入')).length,1);
 });

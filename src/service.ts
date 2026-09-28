@@ -140,8 +140,14 @@ export class AlertService {
       if(effect.type==='notify_no_code'&&task.status!=='no_code_wait')return true;
       if(effect.type==='notify_delivered'&&task.status!=='delivered')return true;
       if(effect.type==='notify_blocked'&&task.status!=='blocked')return true;
-      const title=effect.type==='notify_no_code'?'无需代码修复，请回复“确认关闭”':effect.type==='notify_delivered'?'修复交付完成（不代表线上恢复）':'任务阻塞';
-      await this.deps.notify(task.groupId,`任务 #${task.id} ${title}\n${JSON.stringify(effect.payload,null,2)}`,task.ownerIds);
+      if(effect.type==='notify_blocked') {
+        const mention=this.config.bot.mention??'@机器人';
+        const details=[effect.payload.reason??task.blockReason??'需要人工处理',effect.payload.conclusion,task.mrUrl].filter(Boolean).join('\n');
+        await this.deps.notify(task.groupId,`任务 #${task.id} 需要 Owner 介入\n原因：${details}\n连续无进展轮次：${task.noProgress}。任务已阻塞，等待处理。\n请先处理上述问题，再在本群 ${mention} 发送“任务 #${task.id} 重试”；也可发送“任务 #${task.id} 补充 具体信息”。`,task.ownerIds);
+      } else {
+        const title=effect.type==='notify_no_code'?'无需代码修复，请回复“确认关闭”':'修复交付完成（不代表线上恢复）';
+        await this.deps.notify(task.groupId,`任务 #${task.id} ${title}\n${JSON.stringify(effect.payload,null,2)}`,task.ownerIds);
+      }
     }
     return true;
   }

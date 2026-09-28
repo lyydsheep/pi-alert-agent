@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { incomingFrame, targetFrom, commandFrom, eventFrom } from '../src/wecom.ts';
+import { incomingFrame, targetFrom, commandFrom, eventFrom, sendGroup } from '../src/wecom.ts';
 
 test('authenticated origin, quoted plan and exact intent remain separate', () => {
   const message = incomingFrame({ body: { chattype:'group', msgtype:'text', chatid:'g', msgid:'m', from:{userid:'u'}, text:{content:'等一下'}, quote:{text:{content:'[告警方案:12:3]'}} } });
@@ -24,4 +24,20 @@ test('removes only the configured leading bot mention before parsing Owner comma
   }
   assert.equal(commandFrom(message('@Other Agent\n任务 #1 重试').text), undefined);
   assert.equal(commandFrom(message('@Test AgentExtra\n任务 #1 重试').text), undefined);
+});
+
+
+test('group notification preserves content and requests Owner mentions on the final chunk',async t=>{
+  const requests:Array<{msgtype:string;text:{content:string;mentioned_list:string[]}}>=[];
+  t.mock.method(globalThis,'fetch',async(_url:unknown,init:RequestInit)=>{
+    requests.push(JSON.parse(String(init.body)));
+    return new Response(JSON.stringify({errcode:0}));
+  });
+  const content='需要 Owner 介入\n'.repeat(300);
+  await sendGroup('https://wecom.test/webhook',content,['owner']);
+  assert.ok(requests.length>1);assert.equal(requests.map(r=>r.text.content).join(''),content);
+  for(const [i,r] of requests.entries()){
+    assert.equal(r.msgtype,'text');assert.ok(Buffer.byteLength(r.text.content)<=1800);
+    assert.deepEqual(r.text.mentioned_list,i===requests.length-1?['owner']:[]);
+  }
 });
