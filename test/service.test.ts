@@ -518,3 +518,24 @@ test('does not request Agent review after a status wait pauses the task or for a
   f.advance(30_000);await f.service.pump();
   assert.deepEqual(f.calls.ensureAgentReview,[]);
 });
+
+test('shutdown cancels and drains delivery polling before the caller can close the store',async t=>{
+  const f=fixture(t,async input=>result(input,input.phase==='investigate'?'plan':'fixed'));
+  await f.service.receive(message('stop-poll-1','[告警:alerts:stop-poll] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('stop-poll-2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  let started!:()=>void;let release!:()=>void;let aborted=false;
+  const observed=new Promise<void>(resolve=>{started=resolve;});
+  const waiting=new Promise<void>(resolve=>{release=resolve;});
+  f.service.deps.delivery.status=async(_iid,_head,signal)=>{
+    signal?.addEventListener('abort',()=>{aborted=true;},{once:true});started();await waiting;
+    return {mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},currentHead:true,agentReviewPassed:false,agentReviewStatus:'pending',mergeable:true,checks:{build:'pending'},ownerRequired:false,complete:false};
+  };
+  f.advance(30_000);const poll=f.service.pump();await observed;
+  let stopped=false;const shutdown=f.service.shutdown().then(()=>{stopped=true;});
+  await Promise.resolve();assert.equal(aborted,true);assert.equal(stopped,false);
+  release();await Promise.all([shutdown,poll]);
+  assert.equal(stopped,true);assert.equal(f.service.engine.getTask(1)?.status,'awaiting_checks');
+  assert.deepEqual(f.calls.ensureAgentReview,[]);
+});

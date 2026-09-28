@@ -28,6 +28,8 @@ export class AlertService {
   readonly deps: ServiceDependencies;
   readonly active = new Map<number,{runId:string;controller:AbortController;promise:Promise<void>}>();
   private pumping = false;
+  private pumpDone:Promise<void> = Promise.resolve();
+  private readonly stopping = new AbortController();
   private stopped = false;
   private pollAt = 0;
   private now:()=>number;
@@ -81,9 +83,12 @@ export class AlertService {
   async pump():Promise<void> {
     if(this.pumping||this.stopped)return;
     this.pumping=true;
+    let finishPump!:()=>void;
+    this.pumpDone=new Promise<void>(resolve=>{finishPump=resolve;});
     try {
       this.engine.tick();
       for(const effect of this.engine.outbox()) {
+        if(this.stopped)break;
         const retry=this.store.get<{next_at:number}>('SELECT next_at FROM effect_retry WHERE effect_id=?',effect.id);
         if(retry && retry.next_at>this.now())continue;
         try {
@@ -95,8 +100,8 @@ export class AlertService {
           console.error(`Effect ${effect.id} (${effect.type}) failed:`,error instanceof Error?error.message:'unknown');
         }
       }
-      if(this.now()>=this.pollAt){this.pollAt=this.now()+30_000;await this.pollDelivery();}
-    } finally {this.pumping=false;}
+      if(!this.stopped&&this.now()>=this.pollAt){this.pollAt=this.now()+30_000;await this.pollDelivery();}
+    } finally {this.pumping=false;finishPump();}
   }
 
   private async effect(effect:Effect):Promise<boolean> {
@@ -199,11 +204,13 @@ export class AlertService {
 
   private async pollDelivery():Promise<void> {
     for(const task of this.engine.listTasks()) {
+      if(this.stopped)return;
       const meta=this.store.get<{workspace:string|null;mr_iid:number|null;feedback_id:number}>('SELECT * FROM runtime WHERE task_id=?',task.id);
       if(!meta)continue;
       try {
         if(meta.mr_iid&&['awaiting_checks','delivered'].includes(task.status)) {
-          const status=await this.deps.delivery.status(meta.mr_iid,task.headSha??undefined);
+          const status=await this.deps.delivery.status(meta.mr_iid,task.headSha??undefined,this.stopping.signal);
+          if(this.stopped)return;
           const state=status.mergeRequest.state==='merged'?'merged':status.mergeRequest.state==='closed'?'closed':'open';
           if(state!=='open') {
             this.engine.handleMrFeedback({taskId:task.id,mrUrl:status.mergeRequest.url,mrState:state,kind:'comment'});
@@ -216,7 +223,7 @@ export class AlertService {
             const currentMr=this.store.get<{mr_iid:number|null}>('SELECT mr_iid FROM runtime WHERE task_id=?',task.id);
             if(this.deps.delivery.ensureAgentReview&&!status.ownerRequired&&(status.agentReviewStatus===undefined||status.agentReviewStatus==='pending')
               &&currentMr?.mr_iid===meta.mr_iid&&current?.headSha===status.mergeRequest.head&&['awaiting_checks','delivered'].includes(current.status)) {
-              await this.deps.delivery.ensureAgentReview(meta.mr_iid,status.mergeRequest.head);
+              await this.deps.delivery.ensureAgentReview(meta.mr_iid,status.mergeRequest.head,this.stopping.signal);
               if(this.stopped)return;
             }
             if(status.ownerRequired) {
@@ -230,7 +237,8 @@ export class AlertService {
               const classify=(value:string|undefined):'passed'|'failed'|'pending'=>value==='success'?'passed':['failed','failure','error','canceled'].includes(value??'')?'failed':'pending';
               this.engine.recordMrChecks({taskId:task.id,headSha:status.mergeRequest.head,agentReview:classify(status.agentReviewStatus??(status.agentReviewPassed?'success':undefined)),requiredChecks:[...Object.values(status.checks).map(classify),status.mergeable?'passed':'pending']});
             }
-            const feedback=await this.deps.delivery.feedback(meta.mr_iid);
+            const feedback=await this.deps.delivery.feedback(meta.mr_iid,this.stopping.signal);
+            if(this.stopped)return;
             this.store.transaction(()=>{
               for(const note of feedback.filter(n=>n.id>meta.feedback_id))this.engine.handleMrFeedback({taskId:task.id,mrUrl:status.mergeRequest.url,mrState:'open',kind:note.classification==='change-request'?'change_requested':'comment',body:note.body});
               if(feedback.length)this.store.run('UPDATE runtime SET feedback_id=? WHERE task_id=?',Math.max(meta.feedback_id,...feedback.map(n=>n.id)),task.id);
@@ -243,6 +251,7 @@ export class AlertService {
           this.store.run('UPDATE runtime SET workspace=NULL WHERE task_id=?',task.id);
         }
       } catch(error){
+        if(this.stopped)return;
         const reason=error instanceof Error?error.message:'Unknown MR observation failure';
         this.engine.blockObservation(task.id,task.headSha,reason);
         console.error(`Task ${task.id} observation failed:`,reason);
@@ -251,9 +260,9 @@ export class AlertService {
   }
 
   async shutdown():Promise<void> {
-    this.stopped=true;
+    this.stopped=true;this.stopping.abort();
     for(const active of this.active.values())active.controller.abort();
-    await Promise.allSettled([...this.active.values()].map(x=>x.promise));
+    await Promise.allSettled([this.pumpDone,...[...this.active.values()].map(x=>x.promise)]);
     this.engine.recoverRuns();
   }
 }
