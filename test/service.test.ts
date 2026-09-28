@@ -1,0 +1,459 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { type TestContext } from 'node:test';
+
+import type { Config } from '../src/config.ts';
+import type { DeliveryStatus, MergeRequest, MergeRequestFeedback } from '../src/delivery.ts';
+import type { GitWorkspace, PushResult } from '../src/git.ts';
+import type { PiRunInput, PiRunResult } from '../src/pi/index.ts';
+import { AlertService, type ServiceDependencies } from '../src/service.ts';
+import { Store } from '../src/store.ts';
+import type { IncomingMessage } from '../src/wecom.ts';
+
+const repairPlan = {
+  background: 'request timeout alert', diagnosis: 'lease is ignored', evidence: ['trace-1'],
+  scope: ['worker'], solution: 'honor the lease', acceptance: ['test passes'], risks: ['earlier cancellation'],
+};
+
+function result(input: PiRunInput, kind: 'plan' | 'fixed' | 'no-code'): PiRunResult {
+  const metadata = {
+    taskId: input.taskId, runId: input.runId, sessionId: `session-${input.taskId}`,
+    durationMs: 1, summary: kind, progressKey: `${kind}-${input.taskId}`, progress: true,
+  };
+  if (kind === 'plan') return { ...metadata, status: 'plan', plan: repairPlan };
+  return {
+    ...metadata, status: 'completed', completion: {
+      summary: kind === 'fixed' ? 'fixed' : 'upstream recovered', evidence: ['trace-1'],
+      changedFiles: kind === 'fixed' ? ['worker.ts'] : [], tests: ['worker test'], noCodeChange: kind === 'no-code',
+    },
+  };
+}
+
+function message(messageId: string, text: string, senderId = 'bot', quote = ''): IncomingMessage {
+  return { messageId, groupId: 'group', senderId, text, quote };
+}
+
+function immediate(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function eventually(check: () => boolean, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (check()) return;
+    await immediate();
+  }
+  assert.fail(`Timed out waiting for ${label}`);
+}
+
+function fixture(t: TestContext, run: (input: PiRunInput) => Promise<PiRunResult>, concurrency = 4) {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-alert-service-'));
+  const store = new Store(join(directory, 'state.sqlite'));
+  let now = 1_000_000;
+  const notifications: Array<{ groupId: string; text: string; owners: string[] }> = [];
+  const calls = { prepare: 0, push: 0, createMr: 0, status: 0, cleanup: 0 };
+  let feedback: MergeRequestFeedback[] = [];
+  let deliveryStatus: DeliveryStatus = {
+    mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'opened', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-1' },
+    currentHead: true, agentReviewPassed: true, agentReviewStatus:'success', mergeable:true, checks: { build: 'success' }, ownerRequired: false, complete: true,
+  };
+  const workspace = (taskId: string): GitWorkspace => ({
+    taskId, path: join(directory, 'worktrees', taskId), branch: `fix/faizili_${taskId}`, head: 'base', resumed: false,
+  });
+  const deps: ServiceDependencies = {
+    runner: { run },
+    git: {
+      prepare: async (taskId) => { calls.prepare++; return workspace(taskId); },
+      push: async (): Promise<PushResult> => { calls.push++; return { head: 'head-1', alreadyPresent: false }; },
+      head: async () => 'head-1',
+      cleanup: async () => { calls.cleanup++; return false; },
+    },
+    delivery: {
+      createOrReadMergeRequest: async (): Promise<MergeRequest> => { calls.createMr++; return deliveryStatus.mergeRequest; },
+      status: async () => { calls.status++; return deliveryStatus; },
+      feedback: async (): Promise<MergeRequestFeedback[]> => feedback,
+    },
+    notify: async (groupId, text, owners) => { notifications.push({ groupId, text, owners }); },
+    now: () => now,
+  };
+  const config: Config = {
+    dataDir: directory, repositoryPath: directory, host: '127.0.0.1', port: 8080,
+    concurrency, waitMs: 30 * 60_000, runTimeoutMs: 60 * 60_000,
+    groups: { group: { owners: ['owner'], webhook: 'https://example.test/hook' } },
+    bot: { id: 'bot', secret: 'secret' }, model: { provider: 'test', id: 'test', apiKey: 'test' },
+    delivery: { apiEndpoint: 'https://git.test/api/v4', token: 'token', project: 'p', requiredChecks: ['build'], agentReviewCheck: 'Agent Review' },
+  };
+  const service = new AlertService(config, deps, store);
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }); });
+  return {
+    service, store, notifications, calls,
+    advance: (ms: number) => { now += ms; },
+    setDeliveryStatus: (value: DeliveryStatus) => { deliveryStatus = value; },
+    setFeedback: (value: MergeRequestFeedback[]) => { feedback = value; },
+  };
+}
+
+test('runs intake through approved fix, MR, current checks and delivery', async (t) => {
+  const phases: string[] = [];
+  const f = fixture(t, async (input) => {
+    phases.push(input.phase);
+    return result(input, input.phase === 'investigate' ? 'plan' : 'fixed');
+  });
+
+  await f.service.receive(message('m1', '[告警:alerts:event-1] request timeout'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'investigation plan');
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'awaiting_owner');
+
+  await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'awaiting_checks', 'MR creation');
+  assert.equal(f.calls.push, 1);
+  assert.equal(f.calls.createMr, 1);
+
+  f.advance(30_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'delivered');
+  await f.service.pump();
+  assert.deepEqual(phases, ['investigate', 'execute']);
+  assert.ok(f.notifications.some((notice) => notice.text.includes('修复交付完成（不代表线上恢复）')));
+});
+
+test('retries the durable MR notification after delivery failure', async (t) => {
+  const f = fixture(t, async (input) => result(input, input.phase === 'investigate' ? 'plan' : 'fixed'));
+  await f.service.receive(message('m1', '[告警:alerts:mr-notify] down'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+  await f.service.pump();
+  await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'awaiting_checks', 'MR');
+
+  const notify = f.service.deps.notify;
+  let failed = false;
+  f.service.deps.notify = async (groupId, text, owners) => {
+    if (!failed && text.includes('已创建/更新 MR')) { failed = true; throw new Error('notification unavailable'); }
+    await notify(groupId, text, owners);
+  };
+  const originalError = console.error;
+  console.error = () => undefined;
+  try { await f.service.pump(); } finally { console.error = originalError; }
+  assert.equal(f.service.engine.outbox().filter((effect) => effect.type === 'notify_mr').length, 1);
+
+  f.advance(2_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.outbox().some((effect) => effect.type === 'notify_mr'), false);
+  assert.equal(f.notifications.filter((notice) => notice.text.includes('已创建/更新 MR')).length, 1);
+});
+
+test('keeps no-code conclusion open until the Owner explicitly confirms', async (t) => {
+  const f = fixture(t, async (input) => result(input, 'no-code'));
+  await f.service.receive(message('m1', '[告警:alerts:no-code] recovered'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'no_code_wait', 'no-code conclusion');
+  await f.service.pump();
+  assert.ok(f.notifications.some((notice) => notice.text.includes('无需代码修复')));
+
+  f.advance(4 * 60 * 60_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'no_code_wait');
+  await f.service.receive(message('m2', '任务 #1 确认关闭', 'owner'));
+  assert.equal(f.service.engine.getTask(1)?.status, 'closed');
+});
+
+test('defer resets the full wait and pause stops later timeout dispatch', async (t) => {
+  const phases: string[] = [];
+  const f = fixture(t, async (input) => { phases.push(input.phase); return result(input, 'plan'); });
+  await f.service.receive(message('m1', '[告警:alerts:wait] wait'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+  await f.service.pump();
+  const initialDeadline = f.service.engine.getTask(1)!.waitUntil!;
+
+  f.advance(5 * 60_000);
+  await f.service.receive(message('m2', '任务 #1 等一下', 'owner'));
+  assert.ok(f.service.engine.getTask(1)!.waitUntil! > initialDeadline);
+  f.advance(30 * 60_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.waitStage, 'final');
+  assert.ok(f.notifications.some((notice) => notice.text.includes('提醒：预计')));
+
+  await f.service.receive(message('m3', '任务 #1 暂停', 'owner'));
+  f.advance(2 * 60 * 60_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'paused');
+  assert.deepEqual(phases, ['investigate']);
+});
+
+test('deduplicates bot delivery while linking a second message for the same alert event', async (t) => {
+  const f = fixture(t, async (input) => result(input, 'plan'));
+  const alert = message('same-message', '[告警:alerts:duplicate] down');
+  await f.service.receive(alert);
+  await f.service.receive(alert);
+  assert.equal(f.notifications.length, 1);
+  assert.equal(f.service.engine.listTasks().length, 1);
+  assert.equal(f.service.engine.events(1).length, 1);
+
+  await f.service.receive(message('second-message', '[告警:alerts:duplicate] still down'));
+  assert.equal(f.service.engine.listTasks().length, 1);
+  assert.equal(f.service.engine.events(1).length, 2);
+  assert.ok(f.notifications.at(-1)?.text.includes('已关联已有告警任务'));
+});
+
+test('runs at most four tasks and starts the fifth after the first four wait for Owners', async (t) => {
+  const pending: Array<{ input: PiRunInput; resolve: (value: PiRunResult) => void }> = [];
+  let running = 0;
+  let maxRunning = 0;
+  const f = fixture(t, (input) => {
+    running++;
+    maxRunning = Math.max(maxRunning, running);
+    return new Promise<PiRunResult>((resolve) => pending.push({ input, resolve: (value) => { running--; resolve(value); } }));
+  }, 4);
+  for (let index = 1; index <= 5; index++) {
+    await f.service.receive(message(`m${index}`, `[告警:alerts:parallel-${index}] down`));
+  }
+  await f.service.pump();
+  await eventually(() => pending.length === 4, 'four concurrent investigations');
+  assert.equal(maxRunning, 4);
+  for (const item of pending.slice(0, 4)) item.resolve(result(item.input, 'plan'));
+  await eventually(() => f.service.engine.listTasks().filter((task) => task.status === 'plan_notify_pending').length === 4, 'four plans');
+
+  await f.service.pump();
+  await eventually(() => pending.length === 5, 'fifth investigation');
+  assert.equal(maxRunning, 4);
+  pending[4].resolve(result(pending[4].input, 'plan'));
+  await eventually(() => f.service.engine.getTask(5)?.status === 'plan_notify_pending', 'fifth plan');
+});
+
+test('ignores a runner result returned after shutdown interrupted its fenced run', async (t) => {
+  let pending: { input: PiRunInput; resolve: (value: PiRunResult) => void } | undefined;
+  const f = fixture(t, (input) => new Promise<PiRunResult>((resolve) => { pending = { input, resolve }; }));
+  await f.service.receive(message('m1', '[告警:alerts:interrupted] down'));
+  await f.service.pump();
+  await eventually(() => !!pending, 'runner start');
+
+  const stopping = f.service.shutdown();
+  assert.equal(pending!.input.signal?.aborted, true);
+  pending!.resolve(result(pending!.input, 'plan'));
+  await stopping;
+  assert.equal(f.service.engine.getTask(1)?.planVersion, 0);
+  assert.equal(f.service.engine.getTask(1)?.status, 'queued');
+});
+
+test('rolls task intake back when the inbox receipt cannot be recorded', async (t) => {
+  const f = fixture(t, async (input) => result(input, 'plan'));
+  const originalRun = f.store.run.bind(f.store);
+  f.store.run = ((sql: string, ...values: Parameters<Store['run']>[1][]) => {
+    if (sql.startsWith('INSERT OR IGNORE INTO inbox')) throw new Error('injected inbox failure');
+    return originalRun(sql, ...values);
+  }) as Store['run'];
+
+  await assert.rejects(
+    f.service.receive(message('atomic', '[告警:alerts:atomic] down')),
+    /injected inbox failure/,
+  );
+  assert.equal(f.service.engine.listTasks().length, 0);
+  assert.equal(f.store.get<{ count: number }>('SELECT count(*) AS count FROM events')?.count, 0);
+  assert.equal(f.store.get<{ count: number }>('SELECT count(*) AS count FROM inbox')?.count, 0);
+});
+
+test('remote HEAD and failed Agent review invalidate delivery and schedule retry', async (t) => {
+  const phases: string[] = [];
+  const f = fixture(t, async (input) => { phases.push(input.phase); return result(input, input.phase === 'investigate' ? 'plan' : 'fixed'); });
+  await f.service.receive(message('m1', '[告警:alerts:head-change] down'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+  await f.service.pump();
+  await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'awaiting_checks', 'MR');
+  f.advance(30_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'delivered');
+
+  f.setDeliveryStatus({
+    mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'opened', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-2' },
+    currentHead: false, agentReviewPassed: false, agentReviewStatus: 'pending', mergeable: true,
+    checks: { build: 'pending' }, ownerRequired: true, complete: false,
+  });
+  f.advance(30_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.headSha, 'head-2');
+  assert.equal(f.service.engine.getTask(1)?.status, 'awaiting_checks');
+  assert.equal(f.service.engine.getTask(1)?.completedAt, null);
+  assert.ok(f.notifications.some((notice) => notice.text.includes('存在冲突')));
+
+  f.setDeliveryStatus({
+    mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'opened', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-2' },
+    currentHead: true, agentReviewPassed: false, agentReviewStatus: 'failed', mergeable: true,
+    checks: { build: 'success' }, ownerRequired: false, complete: false,
+  });
+  f.advance(30_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'queued');
+  await f.service.pump();
+  await eventually(() => phases.length === 3, 'Agent review retry run');
+  await eventually(() => f.service.active.size === 0, 'Agent review retry completion');
+  assert.equal(phases[2], 'execute');
+});
+
+test('preserves actionable review feedback and supplies it to the next runner', async (t) => {
+  const inputs: PiRunInput[] = [];
+  const f = fixture(t, async (input) => { inputs.push(input); return result(input, input.phase === 'investigate' ? 'plan' : 'fixed'); });
+  await f.service.receive(message('m1', '[告警:alerts:review] down'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+  await f.service.pump();
+  await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'awaiting_checks', 'MR');
+
+  f.setDeliveryStatus({
+    mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'opened', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-1' },
+    currentHead: true, agentReviewPassed: false, agentReviewStatus: 'pending', mergeable: true,
+    checks: { build: 'pending' }, ownerRequired: false, complete: false,
+  });
+  f.setFeedback([{ id: 11, body: 'Handle the nil lease before retrying.', classification: 'change-request' }]);
+  f.advance(30_000);
+  await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status, 'queued');
+  assert.equal(f.service.engine.events(1).at(-1)?.text, 'Handle the nil lease before retrying.');
+
+  await f.service.pump();
+  await eventually(() => inputs.length === 3, 'feedback retry run');
+  await eventually(() => f.service.active.size === 0, 'feedback retry completion');
+  assert.match(inputs[2].prompt, /Handle the nil lease before retrying\./);
+});
+
+test('drops a pending no-code notification retry after explicit closure', async (t) => {
+  const f = fixture(t, async (input) => result(input, 'no-code'));
+  await f.service.receive(message('m1', '[告警:alerts:no-code-retry] recovered'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'no_code_wait', 'no-code result');
+  const effect = f.service.engine.outbox().find((item) => item.type === 'notify_no_code')!;
+  f.store.run('INSERT INTO effect_retry(effect_id,next_at,attempts) VALUES(?,?,?)', effect.id, 1_001_000, 1);
+
+  await f.service.receive(message('m2', '任务 #1 确认关闭', 'owner'));
+  const notices = f.notifications.length;
+  f.advance(1_000);
+  await f.service.pump();
+  assert.equal(f.notifications.length, notices);
+  assert.equal(f.service.engine.outbox().some((item) => item.id === effect.id), false);
+});
+
+test('blocks when MR recovery finds only a closed MR', async (t) => {
+  const phases: string[] = [];
+  const f = fixture(t, async (input) => { phases.push(input.phase); return result(input, input.phase === 'investigate' ? 'plan' : 'fixed'); });
+  f.setDeliveryStatus({
+    mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state: 'closed', sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-1' },
+    currentHead: true, agentReviewPassed: false, agentReviewStatus: 'pending', mergeable: false,
+    checks: { build: 'pending' }, ownerRequired: false, complete: false,
+  });
+  await f.service.receive(message('m1', '[告警:alerts:closed-mr] down'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+  await f.service.pump();
+  await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+  await f.service.pump();
+  await eventually(() => f.service.engine.getTask(1)?.status === 'blocked', 'closed MR block');
+  await f.service.pump();
+  assert.match(f.service.engine.getTask(1)!.blockReason!, /closed/);
+  assert.ok(f.notifications.some((notice) => notice.text.includes('任务阻塞')));
+  assert.deepEqual(phases, ['investigate', 'execute']);
+});
+
+for (const state of ['closed', 'merged'] as const) {
+  test(`cleans a completed workspace after its MR is ${state} and clears the runtime pointer`, async (t) => {
+    const f = fixture(t, async (input) => result(input, input.phase === 'investigate' ? 'plan' : 'fixed'));
+    await f.service.receive(message('m1', `[告警:alerts:cleanup-${state}] down`));
+    await f.service.pump();
+    await eventually(() => f.service.engine.getTask(1)?.status === 'plan_notify_pending', 'plan');
+    await f.service.pump();
+    await f.service.receive(message('m2', '任务 #1 同意', 'owner'));
+    await f.service.pump();
+    await eventually(() => f.service.engine.getTask(1)?.status === 'awaiting_checks', 'MR');
+    f.advance(30_000);
+    await f.service.pump();
+    assert.equal(f.service.engine.getTask(1)?.status, 'delivered');
+
+    const cleanupCalls = f.calls.cleanup;
+    f.service.deps.git.cleanup = async () => { f.calls.cleanup++; return true; };
+    f.setDeliveryStatus({
+      mergeRequest: { iid: 7, url: 'https://git.test/mr/7', state, sourceBranch: 'fix/faizili_1', targetBranch: 'master', head: 'head-1' },
+      currentHead: true, agentReviewPassed: true, agentReviewStatus: 'success', mergeable: false,
+      checks: { build: 'success' }, ownerRequired: false, complete: false,
+    });
+    f.advance(7 * 24 * 60 * 60_000 + 30_000);
+    await f.service.pump();
+    assert.equal(f.calls.cleanup, cleanupCalls + 1);
+    assert.equal(f.store.get<{ workspace: string | null }>('SELECT workspace FROM runtime WHERE task_id=1')?.workspace, null);
+    f.advance(30_000);
+    await f.service.pump();
+    assert.equal(f.calls.cleanup, cleanupCalls + 1);
+  });
+}
+
+test('external-action conclusions block closure and Owner information resumes the same task', async t=>{
+  let supplied='';let runs=0;
+  const f=fixture(t,async input=>{
+    supplied=input.prompt;runs++;
+    const value=result(input,'no-code');
+    if(value.status==='completed'&&runs===1)value.completion.externalAction='Owner must restore the upstream route';
+    return value;
+  });
+  await f.service.receive(message('external1','[告警:alerts:external] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='blocked','external block');
+  await f.service.pump();
+  assert.ok(f.notifications.some(n=>n.text.includes('restore the upstream route')&&n.owners.includes('owner')));
+  await f.service.receive(message('external2','任务 #1 确认关闭','owner'));
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  await f.service.receive(message('external3','任务 #1 补充 route restored','intruder'));
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  await f.service.receive(message('external4','任务 #1 补充 route restored','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='no_code_wait','new evidence');
+  assert.match(supplied,/route restored/);assert.equal(f.service.engine.listTasks().length,1);
+});
+
+test('MR observation failure visibly blocks and retry resumes checks without another repair',async t=>{
+  let runs=0;
+  const f=fixture(t,async input=>{runs++;return result(input,input.phase==='investigate'?'plan':'fixed');});
+  await f.service.receive(message('permission1','[告警:alerts:permission] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('permission2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  const status=f.service.deps.delivery.status;
+  f.service.deps.delivery.status=async()=>{throw new Error('MR platform access denied');};
+  f.advance(30_000);
+  const log=console.error;console.error=()=>{};
+  try{await f.service.pump();}finally{console.error=log;}
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  await f.service.pump();assert.ok(f.notifications.some(n=>n.text.includes('access denied')));
+  f.service.deps.delivery.status=status;
+  await f.service.receive(message('permission3','任务 #1 重试','owner'));
+  assert.equal(f.service.engine.getTask(1)?.status,'awaiting_checks');
+  f.advance(30_000);await f.service.pump();assert.equal(f.service.engine.getTask(1)?.status,'delivered');
+  assert.equal(runs,2);
+});
+
+test('rewritten model evidence alone cannot evade the three-round no-progress block',async t=>{
+  let rounds=0;
+  const f=fixture(t,async input=>{
+    const value=result(input,input.phase==='investigate'?'plan':'fixed');
+    if(value.status==='completed')value.completion.evidence=[`model claims improvement ${++rounds}`];
+    return value;
+  });
+  const status=f.service.deps.delivery.status;
+  f.service.deps.delivery.status=async(...args)=>({...await status(...args),agentReviewPassed:false,agentReviewStatus:'failed',complete:false});
+  await f.service.receive(message('progress1','[告警:alerts:progress] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('progress2','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  for(let attempt=0;attempt<3;attempt++){
+    f.advance(30_000);await f.service.pump();await f.service.pump();
+    await eventually(()=>['awaiting_checks','blocked'].includes(f.service.engine.getTask(1)!.status),'repair retry');
+  }
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  assert.equal(f.service.engine.getTask(1)?.noProgress,3);
+});
