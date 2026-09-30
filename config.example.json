@@ -1,0 +1,16 @@
+{
+  "dataDir": "./var",
+  "repositoryPath": "/absolute/path/to/business-repository",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "dashboardUrl": "https://alerts.example.com/",
+  "concurrency": 4,
+  "waitMs": 1800000,
+  "runTimeoutMs": 3600000,
+  "bot": {"id":{"env":"WECOM_BOT_ID"},"secret":{"env":"WECOM_BOT_SECRET"}},
+  "groups": {"replace-with-test-group-id":{"owners":["replace-with-owner-id"],"webhook":{"env":"WECOM_GROUP_WEBHOOK"}}},
+  "model": {"provider":"configured-provider","id":"configured-model","api":"openai-completions","endpoint":{"env":"MODEL_ENDPOINT"},"apiKey":{"env":"MODEL_API_KEY"}},
+  "delivery": {"apiEndpoint":{"env":"GIT_API_ENDPOINT"},"token":{"env":"GIT_API_TOKEN"},"project":"test/project","agentReviewCheck":"agent-review","requiredChecks":["tests"]},
+  "tools": {"shell":{"command":"/bin/bash","args":["/absolute/path/to/pi-alert-agent/scripts/limited-shell.sh","/absolute/path/to/data/pi/shell.lock","2"]}},
+  "phoenix": {"endpoint":"http://127.0.0.1:6006/v1/traces","apiKey":{"env":"PHOENIX_SYSTEM_KEY"},"publicUrl":"http://127.0.0.1:8081"}
+}

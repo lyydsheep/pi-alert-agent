@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+.env
+config.local.json
+var/
+work/
+private/
+phoenix-keys.json
+phoenix-viewer.env
+coverage/
+*.sqlite*

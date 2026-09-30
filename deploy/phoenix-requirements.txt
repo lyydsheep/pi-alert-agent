@@ -1,0 +1,2 @@
+arize-phoenix==20.16.0
+supervisor==4.3.0
