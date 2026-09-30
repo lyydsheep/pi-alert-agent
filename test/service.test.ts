@@ -152,6 +152,32 @@ test('same-HEAD pending and conflicts revoke delivery before a queued completion
   assert.equal(f.store.get<{feedback_id:number}>('SELECT feedback_id FROM runtime WHERE task_id=1')?.feedback_id,1);
 });
 
+test('changing tool output does not reset no-progress when executor reports no meaningful progress',async t=>{
+  let rounds=0;
+  const f=fixture(t,async input=>{
+    const value=result(input,input.phase==='investigate'?'plan':'fixed');
+    if(input.phase==='execute'){
+      input.onEvent?.({type:'tool_execution_end',toolName:'bash',isError:false,result:{content:[{type:'text',text:`timestamp ${++rounds}`}]}});
+      value.progress=false;
+    }
+    return value;
+  });
+  const prepare=f.service.deps.git.prepare;
+  f.service.deps.git.prepare=async(...args)=>({...await prepare(...args),head:'head-1'});
+  const status=f.service.deps.delivery.status;
+  f.service.deps.delivery.status=async(...args)=>({...await status(...args),agentReviewPassed:false,agentReviewStatus:'failed',complete:false});
+  await f.service.receive(message('semantic-alert','[告警:alerts:semantic] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('semantic-approve','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  for(let i=0;i<3;i++){
+    f.advance(30_000);await f.service.pump();await f.service.pump();
+    await eventually(()=>['awaiting_checks','blocked'].includes(f.service.engine.getTask(1)!.status),'retry');
+  }
+  assert.equal(f.service.engine.getTask(1)?.status,'blocked');
+  assert.equal(f.service.engine.getTask(1)?.noProgress,3);
+});
+
 test('runs intake through approved fix, MR, current checks and delivery', async (t) => {
   const phases: string[] = [];
   const f = fixture(t, async (input) => {

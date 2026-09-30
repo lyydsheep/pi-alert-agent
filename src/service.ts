@@ -212,8 +212,8 @@ export class AlertService {
           if(event&&typeof event==='object') {
             const tool=event as Record<string,unknown>;
             if(tool.type==='tool_execution_end'&&!tool.isError&&typeof tool.toolName==='string'&&!tool.toolName.startsWith('submit_')) {
-              const output=tool.result as {content?:unknown;details?:{fullOutput?:unknown}}|undefined;
-              const evidence=typeof output?.details?.fullOutput==='string'?output.details.fullOutput:output?.content;
+              const output=tool.result as {content?:unknown;details?:{fullOutput?:unknown;fullOutputSha256?:unknown}}|undefined;
+              const evidence=typeof output?.details?.fullOutputSha256==='string'?output.details.fullOutputSha256:typeof output?.details?.fullOutput==='string'?output.details.fullOutput:output?.content;
               if(evidence!==undefined)observations.add(createHash('sha256').update(JSON.stringify([tool.toolName,evidence])).digest('hex'));
             }
           }
@@ -224,7 +224,7 @@ export class AlertService {
       if(!valid())return;
       // ponytail: exact evidence deduplication; semantic relevance still relies on the executor's investigation.
       // Persist the task's whole history, excluding transport metadata such as timing and temporary output paths.
-      const progress=this.store.transaction(()=>{
+      const freshEvidence=this.store.transaction(()=>{
         this.store.run('INSERT OR IGNORE INTO progress_observations VALUES(?,?)',task.id,`head:${workspace.head}`);
         if(actualHead!==workspace.head)observations.add(`head:${actualHead}`);
         let fresh=false;
@@ -233,6 +233,7 @@ export class AlertService {
         }
         return fresh;
       });
+      const progress=actualHead!==(task.headSha??workspace.head)||(result.progress&&freshEvidence);
       if('plan' in result) {
         this.engine.completeRun({...identity,progress,next:'plan',plan:{body:JSON.stringify({...result.plan,summary:result.summary},null,2)}});
       } else if(result.completion.externalAction && !result.completion.noCodeChange) {
