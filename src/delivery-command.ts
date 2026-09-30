@@ -94,7 +94,8 @@ export class CommandDeliveryClient {
     const ownerRequired = raw.ownerRequired !== false;
     const complete = mr.state === 'opened' && currentHead && agentReviewPassed
       && this.requiredChecks.every((name) => checks[name] === 'success') && mergeable && !ownerRequired;
-    return { mergeRequest: mr, currentHead, agentReviewStatus, agentReviewPassed, checks, mergeable, ownerRequired, complete };
+    const ownerGate=['conflict','draft','approval','discussion'].includes(String(raw.ownerGate))?raw.ownerGate as DeliveryStatus['ownerGate']:undefined;
+    return { mergeRequest: mr, currentHead, agentReviewStatus, agentReviewPassed, checks, mergeable, ownerRequired, ...(typeof raw.ownerAction==='string'?{ownerAction:raw.ownerAction}:{}), ...(ownerGate?{ownerGate}:{}), complete };
   }
 
   async ensureAgentReview(mrIid: number, expectedHead: string, signal?: AbortSignal): Promise<AgentReviewReceipt> {

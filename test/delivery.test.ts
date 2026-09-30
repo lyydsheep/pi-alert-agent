@@ -19,6 +19,7 @@ test('recovers the same MR after a lost create response and binds completion to 
   const mergeRequests: Record<string, unknown>[] = [];
   let loseCreateResponse = true;
   let conflict = false;
+  let draft = false;
   let statuses: Record<string, unknown>[] = [{ id: 1, name: 'build', status: 'success' }];
   const notes = [
     { id: 1, body: 'looks good', system: false, resolvable: false },
@@ -42,7 +43,7 @@ test('recovers the same MR after a lost create response and binds completion to 
       }
     }
     if (request.method === 'GET' && url.pathname.endsWith('/merge_requests/7')) {
-      return send(response, { ...mergeRequests[0], has_conflicts: conflict, detailed_merge_status: conflict ? 'conflict' : 'mergeable' });
+      return send(response, { ...mergeRequests[0], draft, has_conflicts: conflict, detailed_merge_status: conflict ? 'conflict' : draft ? 'draft_status' : 'mergeable' });
     }
     if (request.method === 'GET' && url.pathname.includes('/repository/commits/head-1/statuses')) return send(response, statuses);
     if (request.method === 'GET' && url.pathname.endsWith('/merge_requests/7/notes')) return send(response, notes);
@@ -65,11 +66,18 @@ test('recovers the same MR after a lost create response and binds completion to 
     const mr = await client.createOrReadMergeRequest({ sourceBranch: 'fix/faizili_task-1', title: 'Fix', description: 'Body' });
     assert.equal(mr.iid, 7);
     assert.equal(mergeRequests.length, 1);
+    assert.equal(mergeRequests[0].title, 'Draft: Fix');
 
     assert.equal((await client.status(7, 'head-1')).complete, false, 'missing Agent review fails closed');
     statuses = [...statuses, { id: 2, name: 'Agent Review', status: 'success' }];
     assert.equal((await client.status(7, 'old-head')).complete, false, 'old HEAD cannot complete');
     assert.equal((await client.status(7, 'head-1')).complete, true);
+    draft=true;
+    const waitingOwner=await client.status(7,'head-1');
+    assert.equal(waitingOwner.complete,false);
+    assert.equal(waitingOwner.ownerRequired,true);
+    assert.match(waitingOwner.ownerAction!,/Draft/);
+    draft=false;
     conflict = true;
     const conflicted = await client.status(7, 'head-1');
     assert.equal(conflicted.ownerRequired, true);

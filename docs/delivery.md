@@ -8,6 +8,10 @@ Delivery completes only while the MR is open, its current SHA matches the expect
 
 `feedback()` classifies system notes, unresolved resolvable notes, and explicit `[change-request]` or `/request_changes` notes. Other notes remain ordinary comments and do not reopen work automatically. Closed and merged MRs never satisfy delivery completion.
 
+The HTTP adapter prefixes new MR titles with `Draft:`. Draft, human approval and unresolved discussion gates set `ownerRequired`, optional `ownerGate` and a Chinese `ownerAction`; the service notifies the Owner and never removes Draft or merges automatically. Conflicts and drafts suppress automatic repair and hold feedback consumption until resolved, even when CI is failed. Approval/discussion gates still consume explicit change requests so requested code repairs can proceed. Legacy command bridges without `ownerGate` retain conflict coordination behavior. See the [GitLab merge status contract](https://docs.gitlab.com/api/merge_requests/#merge-status).
+
+A delivered task returns to checks-waiting whenever current-HEAD checks become pending/missing or an Owner gate appears, clearing its completion timestamp and pending delivery notification. Failed checks still schedule repair while approval or discussion is pending; conflict and Draft gates hold automatic repair. Approval/discussion gates also allow missing Agent review to be requested. Due status polling occurs before outbox notifications, and delivery notices must match the current MR URL and HEAD.
+
 Private forges can use a local command bridge instead of exposing forge logic here. Configure `delivery` with `command`, optional `args` and `timeoutMs`, plus explicit `project`, `requiredChecks`, and `agentReviewCheck`. The executable is invoked directly without a shell. It receives one JSON object on stdin and must write one JSON value to stdout:
 
 - `{ "operation": "createOrReadMergeRequest", "project": "...", "sourceBranch": "...", "title": "...", "description": "..." }` returns `MergeRequest`.

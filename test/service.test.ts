@@ -117,6 +117,41 @@ test('ambiguous Owner targets are rejected and quoted alert context is retained'
   assert.equal(f.service.engine.listTasks().length,2);
 });
 
+test('same-HEAD pending and conflicts revoke delivery before a queued completion notice',async t=>{
+  const f=fixture(t,async input=>result(input,input.phase==='investigate'?'plan':'fixed'));
+  await f.service.receive(message('rollback-alert','[告警:alerts:rollback] down'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='plan_notify_pending','plan');
+  await f.service.pump();await f.service.receive(message('rollback-approve','任务 #1 同意','owner'));
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','MR');
+  for(const conflict of [false,true]){
+    if(conflict)f.setFeedback([{id:1,body:'[change-request] inspect build',classification:'change-request'}]);
+    f.service.engine.recordMrChecks({taskId:1,headSha:'head-1',agentReview:'passed',requiredChecks:['passed']});
+    f.setDeliveryStatus({mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},
+      currentHead:true,agentReviewPassed:true,agentReviewStatus:'success',checks:{build:conflict?'failed':'pending'},mergeable:!conflict,ownerRequired:conflict,complete:false});
+    f.advance(30_000);await f.service.pump();
+    assert.equal(f.service.engine.getTask(1)?.status,'awaiting_checks');
+    assert.equal(f.service.engine.getTask(1)?.completedAt,null);
+    if(conflict)assert.equal(f.store.get<{feedback_id:number}>('SELECT feedback_id FROM runtime WHERE task_id=1')?.feedback_id,0);
+  }
+  assert.ok(!f.notifications.some(n=>n.text.includes('修复交付完成')));
+  assert.ok(f.notifications.some(n=>n.text.includes('存在冲突')));
+  f.setFeedback([]);
+  f.setDeliveryStatus({mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},
+    currentHead:true,agentReviewPassed:false,agentReviewStatus:'pending',checks:{build:'failed'},mergeable:false,
+    ownerRequired:true,ownerGate:'approval',ownerAction:'请完成人工审批',complete:false});
+  f.advance(30_000);await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status,'queued','failed CI repairs proceed without first approving broken code');
+  assert.ok(f.calls.ensureAgentReview.some(r=>r.head==='head-1'),'approval gate does not suppress Agent review');
+  await f.service.pump();await eventually(()=>f.service.engine.getTask(1)?.status==='awaiting_checks','CI repair');
+  f.setFeedback([{id:1,body:'[change-request] inspect build',classification:'change-request'}]);
+  f.setDeliveryStatus({mergeRequest:{iid:7,url:'https://git.test/mr/7',state:'opened',sourceBranch:'fix/faizili_1',targetBranch:'master',head:'head-1'},
+    currentHead:true,agentReviewPassed:true,agentReviewStatus:'success',checks:{build:'success'},mergeable:false,
+    ownerRequired:true,ownerGate:'discussion',ownerAction:'请处理评审讨论',complete:false});
+  f.advance(30_000);await f.service.pump();
+  assert.equal(f.service.engine.getTask(1)?.status,'queued','explicit review change requests remain actionable behind a discussion gate');
+  assert.equal(f.store.get<{feedback_id:number}>('SELECT feedback_id FROM runtime WHERE task_id=1')?.feedback_id,1);
+});
+
 test('runs intake through approved fix, MR, current checks and delivery', async (t) => {
   const phases: string[] = [];
   const f = fixture(t, async (input) => {

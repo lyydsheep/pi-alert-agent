@@ -98,6 +98,7 @@ export class AlertService {
     this.pumpDone=new Promise<void>(resolve=>{finishPump=resolve;});
     try {
       this.engine.tick();
+      if(!this.stopped&&this.now()>=this.pollAt){this.pollAt=this.now()+30_000;await this.pollDelivery();}
       for(const effect of this.engine.outbox()) {
         if(this.stopped)break;
         const retry=this.store.get<{next_at:number}>('SELECT next_at FROM effect_retry WHERE effect_id=?',effect.id);
@@ -111,7 +112,6 @@ export class AlertService {
           console.error(`Effect ${effect.id} (${effect.type}) failed:`,error instanceof Error?error.message:'unknown');
         }
       }
-      if(!this.stopped&&this.now()>=this.pollAt){this.pollAt=this.now()+30_000;await this.pollDelivery();}
     } finally {this.pumping=false;finishPump();}
   }
 
@@ -149,7 +149,7 @@ export class AlertService {
       await this.deps.notify(task.groupId,`任务 #${task.id} 已创建/更新 MR：${task.mrUrl}\n如涉及其他服务，请当前 Owner 联系对应 Owner 共同查看。等待当前版本审查与检查。`,task.ownerIds);
     } else {
       if(effect.type==='notify_no_code'&&task.status!=='no_code_wait')return true;
-      if(effect.type==='notify_delivered'&&task.status!=='delivered')return true;
+      if(effect.type==='notify_delivered'&&(task.status!=='delivered'||task.mrUrl!==effect.payload.mrUrl||task.headSha!==effect.payload.headSha))return true;
       if(effect.type==='notify_blocked'&&task.status!=='blocked')return true;
       if(effect.type==='notify_blocked') {
         const mention=this.config.bot.mention??'@机器人';
@@ -274,6 +274,7 @@ export class AlertService {
       try {
         if(meta.mr_iid&&['awaiting_checks','delivered'].includes(task.status)) {
           const status=await this.deps.delivery.status(meta.mr_iid,task.headSha??undefined,this.stopping.signal);
+          const ownerStopsAutomation=status.ownerRequired&&!['approval','discussion'].includes(status.ownerGate??'conflict');
           if(this.stopped)return;
           const state=status.mergeRequest.state==='merged'?'merged':status.mergeRequest.state==='closed'?'closed':'open';
           if(state!=='open') {
@@ -285,21 +286,22 @@ export class AlertService {
             }
             const current=this.engine.getTask(task.id);
             const currentMr=this.store.get<{mr_iid:number|null}>('SELECT mr_iid FROM runtime WHERE task_id=?',task.id);
-            if(this.deps.delivery.ensureAgentReview&&!status.ownerRequired&&(status.agentReviewStatus===undefined||status.agentReviewStatus==='pending')
+            if(this.deps.delivery.ensureAgentReview&&!ownerStopsAutomation&&(status.agentReviewStatus===undefined||status.agentReviewStatus==='pending')
               &&currentMr?.mr_iid===meta.mr_iid&&current?.headSha===status.mergeRequest.head&&['awaiting_checks','delivered'].includes(current.status)) {
               await this.deps.delivery.ensureAgentReview(meta.mr_iid,status.mergeRequest.head,this.stopping.signal);
               if(this.stopped)return;
             }
+            const classify=(value:string|undefined):'passed'|'failed'|'pending'=>value==='success'?'passed':['failed','failure','error','canceled'].includes(value??'')?'failed':'pending';
+            this.engine.recordMrChecks({taskId:task.id,headSha:status.mergeRequest.head,agentReview:ownerStopsAutomation?'pending':classify(status.agentReviewStatus??(status.agentReviewPassed?'success':undefined)),requiredChecks:ownerStopsAutomation?['pending']:[...Object.values(status.checks).map(classify),!status.ownerRequired&&status.mergeable?'passed':'pending']});
             if(status.ownerRequired) {
               // A conflict is an Owner decision, not a cue to inspect another task.
-              const key=`conflict:${task.id}:${status.mergeRequest.head}`;
+              const reason=status.ownerAction??'MR 存在冲突，请 Owner 协调处理';
+              const key=`conflict:${task.id}:${status.mergeRequest.head}:${createHash('sha256').update(reason).digest('hex')}`;
               if(!this.store.get('SELECT message_id FROM inbox WHERE message_id=?',key)){
-                await this.deps.notify(task.groupId,`任务 #${task.id} 的 MR 存在冲突，请 Owner 协调：${task.mrUrl}`,task.ownerIds);
+                await this.deps.notify(task.groupId,`任务 #${task.id} 需要 Owner 介入：${reason}：${task.mrUrl}`,task.ownerIds);
                 this.store.run('INSERT INTO inbox VALUES(?,?)',key,this.now());
               }
-            } else {
-              const classify=(value:string|undefined):'passed'|'failed'|'pending'=>value==='success'?'passed':['failed','failure','error','canceled'].includes(value??'')?'failed':'pending';
-              this.engine.recordMrChecks({taskId:task.id,headSha:status.mergeRequest.head,agentReview:classify(status.agentReviewStatus??(status.agentReviewPassed?'success':undefined)),requiredChecks:[...Object.values(status.checks).map(classify),status.mergeable?'passed':'pending']});
+              if(ownerStopsAutomation)continue;
             }
             const feedback=await this.deps.delivery.feedback(meta.mr_iid,this.stopping.signal);
             if(this.stopped)return;

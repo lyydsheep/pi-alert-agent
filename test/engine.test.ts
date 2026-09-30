@@ -268,6 +268,78 @@ test('keeps only the current HEAD MR notification in the durable outbox', () => 
   assert.equal(notifications[0].payload.headSha, 'head-2');
 });
 
+test('revokes same-HEAD delivery when review or required checks are pending or missing', () => {
+  for (const checks of [
+    { agentReview: 'pending' as const, requiredChecks: ['passed' as const] },
+    { agentReview: 'passed' as const, requiredChecks: ['pending' as const] },
+    { agentReview: 'passed' as const, requiredChecks: [] },
+  ]) {
+    const { engine, advance } = fixture();
+    const started = startInvestigation(engine, 'mr-pending');
+    const taskId = started.taskId;
+    engine.completeRun({ taskId, ...started.run, progress: true, next: 'awaiting_checks' });
+    engine.recordMr(taskId, { url: 'https://example.test/mr/1', branch: 'fix/task-1', headSha: 'head' });
+    const passed = { taskId, headSha: 'head', agentReview: 'passed' as const, requiredChecks: ['passed' as const] };
+    const delivered = engine.recordMrChecks(passed);
+    advance(1);
+
+    const pending = engine.recordMrChecks({ taskId, headSha: 'head', ...checks });
+    assert.equal(pending.accepted, true);
+    assert.equal(pending.task.status, 'awaiting_checks');
+    assert.equal(pending.task.completedAt, null);
+    assert.equal(pending.effects.length, 0);
+    assert.equal(engine.outbox().some(effect => effect.type === 'notify_delivered'), false);
+    assert.equal(engine.tick().some(effect => effect.type === 'start_run'), false);
+
+    const redelivered = engine.recordMrChecks(passed);
+    assert.equal(redelivered.task.status, 'delivered');
+    assert.ok(redelivered.task.completedAt! > delivered.task.completedAt!);
+    assert.equal(engine.outbox().filter(effect => effect.type === 'notify_delivered').length, 1);
+  }
+});
+
+test('queues a retry and cancels delivery notification for same-HEAD failed checks', () => {
+  for (const checks of [
+    { agentReview: 'failed' as const, requiredChecks: ['passed' as const] },
+    { agentReview: 'passed' as const, requiredChecks: ['failed' as const] },
+  ]) {
+    const { engine } = fixture();
+    const started = startInvestigation(engine, 'mr-failed');
+    const taskId = started.taskId;
+    engine.completeRun({ taskId, ...started.run, progress: true, next: 'awaiting_checks' });
+    engine.recordMr(taskId, { url: 'https://example.test/mr/1', branch: 'fix/task-1', headSha: 'head' });
+    engine.recordMrChecks({ taskId, headSha: 'head', agentReview: 'passed', requiredChecks: ['passed'] });
+
+    const failed = engine.recordMrChecks({ taskId, headSha: 'head', ...checks });
+    assert.equal(failed.accepted, true);
+    assert.equal(failed.task.status, 'queued');
+    assert.equal(failed.task.completedAt, null);
+    assert.equal(engine.outbox().some(effect => effect.type === 'notify_delivered'), false);
+    assert.equal(engine.tick().some(effect => effect.type === 'start_run'), true);
+  }
+});
+
+test('cancels old-HEAD delivery notifications and ignores late old-HEAD checks', () => {
+  const { engine, advance } = fixture();
+  const started = startInvestigation(engine, 'mr-stale-checks');
+  const taskId = started.taskId;
+  engine.completeRun({ taskId, ...started.run, progress: true, next: 'awaiting_checks' });
+  engine.recordMr(taskId, { url: 'https://example.test/mr/1', branch: 'fix/task-1', headSha: 'old' });
+  engine.recordMrChecks({ taskId, headSha: 'old', agentReview: 'passed', requiredChecks: ['passed'] });
+  engine.recordMr(taskId, { url: 'https://example.test/mr/1', branch: 'fix/task-1', headSha: 'new' });
+  assert.equal(engine.outbox().some(effect => effect.type === 'notify_delivered'), false);
+  const delivered = engine.recordMrChecks({ taskId, headSha: 'new', agentReview: 'passed', requiredChecks: ['passed'] });
+  advance(1);
+
+  for (const check of ['pending', 'failed', 'passed'] as const) {
+    const late = engine.recordMrChecks({ taskId, headSha: 'old', agentReview: check, requiredChecks: [check] });
+    assert.equal(late.accepted, false);
+    assert.deepEqual(late.task, delivered.task);
+    assert.equal(late.effects.length, 0);
+    assert.deepEqual(engine.outbox().filter(effect => effect.type === 'notify_delivered'), delivered.effects);
+  }
+});
+
 test('does not apply an old plan approval after the task reaches MR checks', () => {
   const { engine } = fixture();
   const proposed = reachPlan(engine, 'late-approval');

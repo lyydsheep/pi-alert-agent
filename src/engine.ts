@@ -477,7 +477,7 @@ export class Engine {
         return { task, effects: [], accepted: false };
       }
       const changed = task.mrUrl !== input.url || task.headSha !== input.headSha;
-      this.cancelPending(task.id, ['start_run', ...(changed ? ['notify_mr' as const] : [])], now);
+      this.cancelPending(task.id, ['start_run', ...(changed ? ['notify_mr' as const, 'notify_delivered' as const] : [])], now);
       this.store.run(
         `UPDATE tasks SET mr_url=?,branch=?,head_sha=?,mr_state=?,status='awaiting_checks',run_id=NULL,run_deadline=NULL,
          no_progress=0,completed_at=NULL,updated_at=? WHERE id=?`,
@@ -500,15 +500,16 @@ export class Engine {
       if (!['awaiting_checks', 'delivered'].includes(task.status)) return { task, effects: [], accepted: false };
       const now = this.clock();
       const failed = input.agentReview === 'failed' || input.requiredChecks.includes('failed');
-      const passed = input.agentReview === 'passed' && input.requiredChecks.every((check) => check === 'passed');
+      const passed = input.agentReview === 'passed' && input.requiredChecks.length > 0 && input.requiredChecks.every((check) => check === 'passed');
       const effects: Effect[] = [];
+      if (!passed) this.cancelPending(task.id, ['notify_delivered'], now);
       if (passed && task.status !== 'delivered') {
         this.store.run(`UPDATE tasks SET status='delivered',completed_at=?,updated_at=? WHERE id=?`, now, now, task.id);
         effects.push(this.enqueue(task.id, 'notify_delivered', { mrUrl: task.mrUrl, headSha: task.headSha }, now));
       } else if (failed) {
         this.store.run(`UPDATE tasks SET status='queued',completed_at=NULL,updated_at=? WHERE id=?`, now, task.id);
-      } else if (task.status !== 'delivered') {
-        this.store.run(`UPDATE tasks SET status='awaiting_checks',updated_at=? WHERE id=?`, now, task.id);
+      } else if (!passed) {
+        this.store.run(`UPDATE tasks SET status='awaiting_checks',completed_at=NULL,updated_at=? WHERE id=?`, now, task.id);
       }
       return { task: this.readTask(task.id)!, effects, accepted: true };
     });

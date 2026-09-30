@@ -25,6 +25,8 @@ export interface DeliveryStatus {
   checks: Record<string, string | undefined>;
   mergeable?: boolean;
   ownerRequired: boolean;
+  ownerAction?: string;
+  ownerGate?: 'conflict'|'draft'|'approval'|'discussion';
   complete: boolean;
 }
 
@@ -87,7 +89,7 @@ export class GitLabDeliveryClient {
       const created = await this.request('POST', 'merge_requests', {
         source_branch: input.sourceBranch,
         target_branch: this.targetBranch,
-        title: input.title,
+        title: /^(?:draft|wip):/i.test(input.title)?input.title:`Draft: ${input.title}`,
         description: input.description,
       }, signal);
       return this.mergeRequest(created);
@@ -117,13 +119,18 @@ export class GitLabDeliveryClient {
     const agentReviewStatus = latest.get(this.agentReviewCheck)?.status;
     const agentReviewPassed = agentReviewStatus === 'success';
     const currentHead = expectedHead === undefined || expectedHead === mergeRequest.head;
-    const ownerRequired = raw.has_conflicts === true || raw.merge_status === 'cannot_be_merged' || raw.detailed_merge_status === 'conflict';
+    const draft = raw.draft === true || raw.work_in_progress === true || raw.detailed_merge_status === 'draft_status';
+    const conflict = raw.has_conflicts === true || raw.detailed_merge_status === 'conflict' || typeof raw.detailed_merge_status !== 'string' && raw.merge_status === 'cannot_be_merged';
+    const approval = raw.detailed_merge_status === 'not_approved' || raw.detailed_merge_status === 'discussions_not_resolved';
+    const ownerRequired = draft || conflict || approval;
+    const ownerGate = conflict?'conflict':draft?'draft':raw.detailed_merge_status==='not_approved'?'approval':raw.detailed_merge_status==='discussions_not_resolved'?'discussion':undefined;
+    const ownerAction = conflict ? 'MR 存在冲突，请 Owner 协调处理' : draft ? 'MR 仍为 Draft，请 Owner 审阅并在平台标记为可评审；Agent 不会自行解除 Draft 或合并' : approval ? 'MR 需要 Owner 完成人工审批或解决未完成讨论' : undefined;
     const mergeable = typeof raw.detailed_merge_status === 'string'
       ? raw.detailed_merge_status === 'mergeable'
       : raw.merge_status === 'can_be_merged';
     const allChecksPassed = this.requiredChecks.every((name) => checks[name] === 'success');
     const complete = mergeRequest.state === 'opened' && currentHead && agentReviewPassed && allChecksPassed && mergeable && !ownerRequired;
-    return { mergeRequest, currentHead, agentReviewStatus, agentReviewPassed, checks, mergeable, ownerRequired, complete };
+    return { mergeRequest, currentHead, agentReviewStatus, agentReviewPassed, checks, mergeable, ownerRequired, ...(ownerAction?{ownerAction,ownerGate}:{}), complete };
   }
 
   async feedback(mrIid: number, signal?: AbortSignal): Promise<MergeRequestFeedback[]> {
