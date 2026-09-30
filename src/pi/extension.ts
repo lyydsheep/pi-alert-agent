@@ -1,5 +1,10 @@
 import { spawn } from "node:child_process";
-import { writeSync } from "node:fs";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, writeSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { stop } from "../delivery-command.ts";
 import { createBashToolDefinition, createLocalBashOperations, type BashToolOptions } from "@earendil-works/pi-coding-agent";
 
 type ExtensionApi = {
@@ -22,6 +27,47 @@ const strings = { type: "array", items: string };
 
 type AdapterName = "source" | "logs" | "trace" | "alert" | "shell";
 
+const INLINE_OUTPUT_BYTES = 256 * 1024;
+const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
+
+function emitTrace(value: unknown): void {
+  const fd = process.env.PI_ALERT_TRACE_FD;
+  if (fd === undefined) return;
+  const bytes = Buffer.from(JSON.stringify(value) + "\n");
+  for (let offset = 0; offset < bytes.length;) offset += writeSync(Number(fd), bytes, offset);
+}
+
+function captureOutput(toolName: string, toolCallId: string, stream?: string) {
+  const root = process.env.TMPDIR ?? tmpdir();
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  const path = join(mkdtempSync(join(root, "pi-output-")), "output.txt");
+  const fd = openSync(path, "wx", 0o600);
+  const hash = createHash("sha256"), decoder = new StringDecoder("utf8");
+  let bytes = 0, sequence = 0, closed = false;
+  const emit = (data: string, rawBytesBase64?: string) => {
+    if (data || rawBytesBase64) emitTrace({ type: "pi_tool_output", toolName, toolCallId, stream, sequence: sequence++, data, ...(rawBytesBase64?{rawBytesBase64}:{}) });
+  };
+  return {
+    write(data: Buffer) {
+      if (bytes + data.length > MAX_OUTPUT_BYTES) throw new Error(`Tool output exceeds ${MAX_OUTPUT_BYTES} bytes; command stopped. Partial output retained at ${path}`);
+      for (let offset = 0; offset < data.length;) offset += writeSync(fd, data, offset);
+      bytes += data.length; hash.update(data);
+      for (let offset = 0; offset < data.length; offset += 8 * 1024) {
+        const part=data.subarray(offset,offset+8*1024);
+        emit(decoder.write(part),part.toString('base64'));
+      }
+    },
+    finish() {
+      if (!closed) { closed = true; closeSync(fd); emit(decoder.end()); }
+    },
+    details() {
+      const fullOutput=bytes<=INLINE_OUTPUT_BYTES?readFileSync(path,"utf8"):undefined;
+      return { fullOutputPath: path, fullOutputBytes: bytes, fullOutputSha256: hash.copy().digest("hex"),
+        ...(fullOutput!==undefined&&Buffer.byteLength(fullOutput)<=INLINE_OUTPUT_BYTES?{fullOutput}:{}) };
+    },
+  };
+}
+
 function command(name: AdapterName): { command: string; args: string[] } | undefined {
   const raw = process.env[`PI_ALERT_${name.toUpperCase()}_TOOL`];
   if (!raw) return undefined;
@@ -32,7 +78,7 @@ function command(name: AdapterName): { command: string; args: string[] } | undef
   return value as { command: string; args: string[] };
 }
 
-function execute(spec: { command: string; args: string[] }, input: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+function execute(spec: { command: string; args: string[] }, input: Record<string, unknown>, toolName: string, toolCallId: string, signal?: AbortSignal): Promise<{content:Array<{type:string;text:string}>;details:Record<string,unknown>}> {
   return new Promise((resolve, reject) => {
     const args = [...spec.args];
     if ("traceId" in input) args.push(String(input.traceId));
@@ -41,20 +87,39 @@ function execute(spec: { command: string; args: string[] }, input: Record<string
     if ("server" in input) args.push("--server", String(input.server));
     if ("query" in input && "start" in input) args.push("--query", String(input.query));
     const { PI_ALERT_API_KEY: _apiKey, ...env } = process.env;
-    const child = spawn(spec.command, args, { cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"] });
-    const output: Buffer[] = [];
-    const errors: Buffer[] = [];
-    child.stdout.on("data", (chunk) => output.push(chunk));
-    child.stderr.on("data", (chunk) => errors.push(chunk));
-    child.on("error", reject);
+    const output = captureOutput(toolName, toolCallId, "stdout"), errors = captureOutput(toolName, toolCallId, "stderr");
+    const child = spawn(spec.command, args, { cwd: process.cwd(), env, detached:process.platform!=='win32', stdio: ["pipe", "pipe", "pipe"] });
+    emitTrace({type:'pi_query_process',state:'started',pid:child.pid,ppid:process.pid});
+    let failure: Error | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
+    let exitTimer: NodeJS.Timeout | undefined, exited=false;
+    const abort = () => { stop(child,"SIGTERM");killTimer??=setTimeout(()=>stop(child,"SIGKILL"),5_000);killTimer.unref(); };
+    const releasePipes = () => { stop(child,"SIGKILL");child.stdout.destroy();child.stderr.destroy(); };
+    const idleAfterExit = () => { if(exited){if(exitTimer)clearTimeout(exitTimer);exitTimer=setTimeout(releasePipes,100);} };
+    const capture = (target: ReturnType<typeof captureOutput>, chunk: Buffer) => {
+      if (failure) return;
+      try { target.write(chunk); } catch (error) { failure = error as Error; abort(); }
+      idleAfterExit();
+    };
+    child.stdout.on("data", (chunk) => capture(output, chunk));
+    child.stderr.on("data", (chunk) => capture(errors, chunk));
+    child.on("error", error => { failure = error; });
+    child.on("exit",()=>{exited=true;idleAfterExit();});
     child.on("close", (code) => {
       signal?.removeEventListener("abort", abort);
-      const stderr = Buffer.concat(errors).toString("utf8");
-      if (code === 0) resolve(Buffer.concat(output).toString("utf8"));
-      else reject(new Error(`${spec.command} exited ${code}${stderr ? `: ${stderr}` : ""}`));
+      if(killTimer)clearTimeout(killTimer);
+      if(exitTimer)clearTimeout(exitTimer);
+      stop(child,"SIGKILL");
+      emitTrace({type:'pi_query_process',state:'ended',pid:child.pid,ppid:process.pid});
+      output.finish(); errors.finish();
+      const details = output.details(), stderr = errors.details();
+      if (failure) reject(failure);
+      else if (signal?.aborted) reject(new Error("Query cancelled"));
+      else if (code === 0) resolve({ content: [{ type: "text", text: typeof details.fullOutput === "string" ? details.fullOutput : `Output: ${details.fullOutputBytes} bytes. Read full result from ${details.fullOutputPath}` }], details });
+      else reject(new Error(`${spec.command} exited ${code}; stderr: ${stderr.fullOutput ?? stderr.fullOutputPath}; stdout: ${details.fullOutputPath}`));
     });
-    const abort = () => child.kill("SIGTERM");
     signal?.addEventListener("abort", abort, { once: true });
+    if(signal?.aborted)abort();
     child.stdin.end(JSON.stringify(input));
   });
 }
@@ -69,23 +134,34 @@ export default function register(pi: ExtensionApi): void {
   } : {};
   const bash = createBashToolDefinition(process.cwd(), options);
   const operations = createLocalBashOperations();
-  const outputs = new Map<string, Buffer[]>();
+  const outputs = new Map<string, ReturnType<typeof captureOutput>>();
   pi.registerTool({ ...bash, async execute(...args: Parameters<typeof bash.execute>) {
-    const chunks: Buffer[] = [];
-    outputs.set(args[0], chunks);
+    const output = captureOutput("bash", args[0]);
+    outputs.set(args[0], output);
+    let failure: Error | undefined;
     const tool = createBashToolDefinition(process.cwd(), { ...options, operations: {
-      exec: (command, cwd, execution) => operations.exec(command, cwd, { ...execution,
-        onData: (data) => { chunks.push(Buffer.from(data)); execution.onData(data); },
-      }),
+      exec: (command, cwd, execution) => {
+        const controller = new AbortController();
+        return operations.exec(command, cwd, { ...execution,
+          signal: execution.signal ? AbortSignal.any([execution.signal, controller.signal]) : controller.signal,
+          onData: (data) => {
+            if (failure) return;
+            try { output.write(Buffer.from(data)); execution.onData(data); }
+            catch (error) { failure = error as Error; controller.abort(); }
+          },
+        });
+      },
     } });
-    return tool.execute(...args);
+    try { const result = await tool.execute(...args); if (failure) throw failure; return result; }
+    catch(error) { throw failure ?? error; }
+    finally { output.finish(); }
   } });
   pi.on?.("tool_result", (event) => {
-    const chunks = event.toolName === "bash" ? outputs.get(event.toolCallId) : undefined;
-    if (!chunks) return;
+    const output = event.toolName === "bash" ? outputs.get(event.toolCallId) : undefined;
+    if (!output) return;
     outputs.delete(event.toolCallId);
     return { details: { ...(event.details && typeof event.details === "object" ? event.details : {}),
-      fullOutput: Buffer.concat(chunks).toString("utf8"),
+      ...output.details(),
     } };
   });
   pi.on?.("before_provider_request", (event, context) => {
@@ -113,7 +189,7 @@ export default function register(pi: ExtensionApi): void {
       description,
       parameters,
       async execute(_id: string, input: Record<string, unknown>, signal?: AbortSignal) {
-        return { content: [{ type: "text", text: await execute(spec, input, signal) }], details: {} };
+        return execute(spec, input, `query_${name}`, _id, signal);
       },
     });
   }

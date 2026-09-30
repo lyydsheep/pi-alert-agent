@@ -13,8 +13,8 @@ const fixture = fileURLToPath(new URL("./pi-fixture.mjs", import.meta.url));
 const adapter = fileURLToPath(new URL("./pi-adapter.mjs", import.meta.url));
 const supervisor = fileURLToPath(new URL("../src/pi/supervisor.ts", import.meta.url));
 
-async function waitFor(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function waitFor(path: string, attempts=100): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try { await access(path); return; } catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
   }
   throw new Error(`Timed out waiting for ${path}`);
@@ -72,7 +72,7 @@ test("returns completion fields from an execution round", async () => {
 });
 
 test("keeps large provider traces separate from Pi JSONL writes", async () => {
-  const { root, runner } = await setup();
+  const { root, runner } = await setup({timeoutMs:8_000});
   const events: unknown[] = [];
   try {
     const result = await runner.run({
@@ -174,6 +174,21 @@ test("supervisor terminates Pi when its parent IPC connection disappears", async
     if (!child.killed) child.kill("SIGKILL");
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('supervisor terminates registered query groups when Pi ignores shutdown',async()=>{
+  const f=await setup({timeoutMs:10_000,killGraceMs:100}),heartbeat=join(f.root,'heartbeat');
+  const producer=`const fs=require('fs');process.on('SIGTERM',()=>{});setInterval(()=>fs.writeFileSync(${JSON.stringify(heartbeat)},String(Date.now())),5);`;
+  const wrapper=`const {spawn}=require('child_process');process.on('SIGTERM',()=>{});spawn(process.execPath,['-e',${JSON.stringify(producer)}],{stdio:['ignore','inherit','inherit']});setInterval(()=>{},1000);`;
+  const runner=new PiRunner({...f.config,tools:{alert:{command:process.execPath,args:['-e',wrapper]}}});
+  const controller=new AbortController();let settled=false;
+  const pending=runner.run({taskId:'tree',runId:'tree',cwd:f.root,sessionPath:join(f.root,'sessions'),phase:'investigate',prompt:'[query-tree]',signal:controller.signal});
+  const rejected=assert.rejects(pending,(error:unknown)=>error instanceof PiRunError&&error.kind==='cancelled').finally(()=>{settled=true;});
+  try{
+    await waitFor(heartbeat,800);controller.abort();await rejected;
+    const last=await readFile(heartbeat,'utf8');await new Promise(r=>setTimeout(r,100));
+    assert.equal(await readFile(heartbeat,'utf8'),last);
+  }finally{controller.abort();if(!settled)await rejected;await rm(f.root,{recursive:true,force:true});}
 });
 
 test("installed Pi package exposes its supported subprocess client", async () => {

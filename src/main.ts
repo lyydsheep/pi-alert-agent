@@ -15,7 +15,7 @@ import { acquireServiceLock } from './lock.ts';
 const config=loadConfig(process.argv[2]??'config.local.json');
 const releaseLock=await acquireServiceLock(config.dataDir);
 let exiting=false;
-const observer=config.phoenix?createObserver({endpoint:config.phoenix.endpoint,apiKey:config.phoenix.apiKey}):undefined;
+const observer=config.phoenix?createObserver({endpoint:config.phoenix.endpoint,apiKey:config.phoenix.apiKey,spoolDir:join(config.dataDir,'trace-spool')}):undefined;
 const service=new AlertService(config,{
   runner:new PiRunner({agentDir:join(config.dataDir,'pi'),model:config.model,timeoutMs:config.runTimeoutMs,tools:config.tools,skills:config.skills}),
   git:new GitWorkspaceManager({repositoryPath:config.repositoryPath,worktreeRoot:join(config.dataDir,'worktrees'),targetBranch:'master'}),

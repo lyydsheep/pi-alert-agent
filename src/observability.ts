@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
+import { closeSync, fsyncSync, mkdirSync, openSync, opendirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export interface Observer {
   event(taskId: string, runId: string, event: unknown): void;
@@ -8,10 +10,13 @@ export interface Observer {
 type Attribute = { key: string; value: { stringValue?: string; intValue?: string } };
 type SpanEvent = { timeUnixNano: string; name: string; attributes: Attribute[] };
 type Span = Record<string, unknown>;
-type OpenSpan = { spanId: string; name: string; kind: 'AGENT' | 'LLM' | 'TOOL'; start: string; attributes: Attribute[]; events: SpanEvent[]; failed?: string };
-type Run = { taskId: string; runId: string; traceId: string; sessionId: string; root: OpenSpan; pendingMessage?: OpenSpan; message?: OpenSpan; tools: Map<string, OpenSpan> };
+type OpenSpan = { spanId: string; name: string; kind: 'AGENT' | 'LLM' | 'TOOL' | 'CHAIN'; start: string; attributes: Attribute[]; events: SpanEvent[]; failed?: string };
+type Run = { taskId: string; runId: string; traceId: string; sessionId: string; root: OpenSpan; pendingMessage?: OpenSpan; message?: OpenSpan; tools: Map<string, OpenSpan>; toolParents: Map<string, string> };
 
-const MAX_BUFFERED_EVENTS = 512;
+const MAX_ACTIVE_BYTES = 512 * 1024;
+const MAX_BATCH_BYTES = 1024 * 1024;
+const MAX_SPOOL_BYTES = 1024 * 1024 * 1024;
+const RAW_CHUNK_BYTES = 32 * 1024;
 const BATCH_SIZE = 50;
 const TIMEOUT_MS = 5_000;
 const EPOCH_OFFSET = BigInt(Date.now()) * 1_000_000n - process.hrtime.bigint();
@@ -39,8 +44,8 @@ function open(name: string, kind: OpenSpan['kind'], attributes: Attribute[] = []
   return { spanId: randomBytes(8).toString('hex'), name, kind, start: nanos(), attributes, events: [] };
 }
 
-function rawEvent(value: unknown): SpanEvent {
-  return { timeUnixNano: nanos(), name: 'pi.raw', attributes: [attribute('pi.event', JSON.stringify(value))] };
+function rawEvent(serialized: string): SpanEvent {
+  return { timeUnixNano: nanos(), name: 'pi.raw', attributes: [attribute('pi.event', serialized)] };
 }
 
 function finish(run: Run, value: OpenSpan, parentSpanId?: string): Span {
@@ -50,18 +55,6 @@ function finish(run: Run, value: OpenSpan, parentSpanId?: string): Span {
     attributes: [attribute('task.id', run.taskId), attribute('run.id', run.runId), attribute('session.id', run.sessionId), attribute('openinference.span.kind', value.kind), ...value.attributes],
     events: value.events,
     status: value.failed ? { code: 2, message: value.failed } : { code: 1 },
-  };
-}
-
-function eventCount(span: Span): number { return Array.isArray(span.events) ? span.events.length : 0; }
-
-function lossSpan(count: number): Span {
-  const time = nanos();
-  return {
-    traceId: randomBytes(16).toString('hex'), spanId: randomBytes(8).toString('hex'), name: 'pi.observability.loss', kind: 1,
-    startTimeUnixNano: time, endTimeUnixNano: time,
-    attributes: [attribute('openinference.span.kind', 'CHAIN'), attribute('pi.observability.dropped_events', count)], events: [],
-    status: { code: 2, message: `${count} complete Pi events were dropped` },
   };
 }
 
@@ -119,111 +112,192 @@ function encodeSpan(span: Span): Buffer {
   ]);
 }
 
-function encodeExportRequest(spans: Span[]): Buffer {
+function encodeExportRequest(spans: Buffer[]): Buffer {
   const resource = messageField(1, encodeAttribute(attribute('service.name', 'pi-alert-agent')));
   const scope = Buffer.concat([stringField(1, 'pi-alert-agent'), stringField(2, '1')]);
-  const scopeSpans = Buffer.concat([messageField(1, scope), ...spans.map((span) => messageField(2, encodeSpan(span)))]);
+  const scopeSpans = Buffer.concat([messageField(1, scope), ...spans.map((span) => messageField(2, span))]);
   return messageField(1, Buffer.concat([messageField(1, resource), messageField(2, scopeSpans)]));
 }
 
-export function createObserver(options: { endpoint: string; apiKey?: string }): Observer {
+export function createObserver(options: { endpoint: string; apiKey?: string; spoolDir: string; retryMs?: number; maxSpoolBytes?: number; maxBatchBytes?: number; maxActiveBytes?: number }): Observer {
   const endpoint = new URL(options.endpoint).toString();
+  const maxBatchBytes = options.maxBatchBytes ?? MAX_BATCH_BYTES;
+  const maxActiveBytes = options.maxActiveBytes ?? MAX_ACTIVE_BYTES;
+  const maxSpoolBytes = options.maxSpoolBytes ?? MAX_SPOOL_BYTES;
+  for (const size of [maxBatchBytes, maxActiveBytes, maxSpoolBytes, options.retryMs ?? 1_000]) {
+    if (!Number.isSafeInteger(size) || size <= 0) throw new Error('Phoenix spool limits must be positive integers');
+  }
+  mkdirSync(options.spoolDir, { recursive: true, mode: 0o700 });
   const runs = new Map<string, Run>();
   const closedRuns = new Set<string>();
+  const closedParents = new Map<string, { spanId: string; sessionId: string }>();
   const closedOrder: string[] = [];
-  const queue: Span[] = [];
-  let bufferedEvents = 0;
-  let dropped = 0;
+  let spoolBytes = 0;
   let sending: Promise<void> | undefined;
   let closed = false;
+  let sequence = 0;
+
+  // ponytail: one observer owns this directory; use a locked spool for multiple writers.
+  const files = function* (includeTemporary = false) {
+    const directory = opendirSync(options.spoolDir);
+    try {
+      let item;
+      while ((item = directory.readSync())) if (item.isFile() && (item.name.endsWith('.span') || includeTemporary && item.name.endsWith('.span.tmp'))) yield join(options.spoolDir, item.name);
+    } finally { directory.closeSync(); }
+  };
+  for (const file of files(true)) {
+    spoolBytes += statSync(file).size;
+    if (file.endsWith('.tmp')) process.stderr.write(`Phoenix incomplete spool file retained for inspection: ${file}\n`);
+  }
 
   const enqueue = (span: Span) => {
-    if (queue.length >= MAX_BUFFERED_EVENTS) {
-      const count = eventCount(span);
-      bufferedEvents -= count;
-      dropped += count;
-    } else queue.push(span);
+    const payload = encodeSpan(span);
+    if (payload.length + 512 > maxBatchBytes) throw new Error(`Phoenix span exceeds export byte budget (${payload.length} bytes)`);
+    if (spoolBytes + payload.length > maxSpoolBytes) throw new Error(`Phoenix spool quota exceeded (${spoolBytes}/${maxSpoolBytes} bytes); span not persisted`);
+    const file = join(options.spoolDir, `${Date.now()}-${sequence++}-${span.spanId}.span`);
+    const temporary = `${file}.tmp`;
+    try {
+      writeFileSync(temporary, payload, { flag: 'wx', mode: 0o600, flush: true });
+      renameSync(temporary, file);
+      spoolBytes += payload.length;
+      const directory = openSync(options.spoolDir, 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    } catch (error) {
+      try { unlinkSync(temporary); } catch { /* Already renamed or not created. */ }
+      throw error;
+    }
   };
 
-  const exportBatch = async (spans: Span[]) => {
-    const payload = new Uint8Array(encodeExportRequest(spans));
+  const exportBatch = async (payload: Buffer) => {
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/x-protobuf', ...(options.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}) },
-      body: payload,
+      body: new Uint8Array(payload),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!response.ok) throw new Error(`Phoenix OTLP export returned ${response.status}`);
+    const responseBody = Buffer.from(await response.arrayBuffer());
+    // OTLP success may include partial_success (protobuf field 1); keep the batch for replay.
+    if (responseBody.length && response.headers.get('content-type')?.includes('protobuf')) throw new Error('Phoenix OTLP acknowledgement contains partial success; batch retained');
   };
 
   const pump = (): Promise<void> => {
     if (sending) return sending;
     sending = (async () => {
-      while (queue.length || dropped) {
-        const lossCount = dropped;
-        if (lossCount) { queue.unshift(lossSpan(lossCount)); dropped = 0; }
-        const batch = queue.splice(0, BATCH_SIZE);
-        const batchEvents = batch.reduce((sum, span) => sum + eventCount(span), 0);
-        try {
-          await exportBatch(batch);
-          bufferedEvents -= batchEvents;
-        } catch (error) {
-          const queuedEvents = queue.reduce((sum, span) => sum + eventCount(span), 0);
-          dropped = lossCount + batchEvents + queuedEvents;
-          bufferedEvents -= batchEvents + queuedEvents;
-          queue.length = 0;
-          process.stderr.write(`Phoenix trace export failed; ${dropped} complete event(s) not exported: ${String(error)}\n`);
-          break;
+      try {
+        while (true) {
+          const batch: { file: string; payload: Buffer }[] = [];
+          let bytes = 256;
+          for (const file of files()) {
+            const size = statSync(file).size;
+            if (size + 512 > maxBatchBytes) throw new Error(`Phoenix persisted span exceeds export byte budget: ${file}`);
+            if (batch.length === BATCH_SIZE || bytes + size + 16 > maxBatchBytes) break;
+            batch.push({ file, payload: readFileSync(file) });
+            bytes += size + 16;
+          }
+          if (!batch.length) break;
+          const payload = encodeExportRequest(batch.map((item) => item.payload));
+          if (payload.length > maxBatchBytes) throw new Error('Phoenix export batch exceeds byte budget');
+          await exportBatch(payload);
+          for (const item of batch) { unlinkSync(item.file); spoolBytes -= item.payload.length; }
         }
+      } catch (error) {
+        process.stderr.write(`Phoenix trace export failed; persisted spans retained (${spoolBytes} bytes): ${String(error)}\n`);
       }
     })().finally(() => { sending = undefined; });
     return sending;
   };
 
-  const attach = (span: OpenSpan, value: unknown) => {
-    if (bufferedEvents >= MAX_BUFFERED_EVENTS) dropped++;
-    else { span.events.push(rawEvent(value)); bufferedEvents++; }
+  const attach = (run: Run, span: Pick<OpenSpan, 'spanId'>, value: unknown) => {
+    const serialized = JSON.stringify(value);
+    const bytes = Buffer.from(serialized);
+    const count = Math.ceil(bytes.length / RAW_CHUNK_BYTES);
+    const eventId = randomBytes(8).toString('hex');
+    for (let index = 0; index < count; index++) {
+      const child = open(record(value)?.type === 'pi_tool_output' ? 'pi.tool.output' : 'pi.event', 'CHAIN');
+      const event = record(value);
+      if (typeof event?.toolCallId === 'string') child.attributes.push(attribute('tool.call_id', event.toolCallId));
+      if (typeof event?.sequence === 'number') child.attributes.push(attribute('pi.output.sequence', event.sequence));
+      if (typeof event?.toolName === 'string') child.attributes.push(attribute('tool.name', event.toolName));
+      if (typeof event?.stream === 'string') child.attributes.push(attribute('pi.output.stream', event.stream));
+      if (event?.type === 'pi_tool_output' && span.spanId === run.root.spanId) child.attributes.push(attribute('pi.output.parent_missing', 'true'));
+      if (count === 1) child.events.push(rawEvent(serialized));
+      else child.events.push({ timeUnixNano: nanos(), name: 'pi.raw.fragment', attributes: [
+        attribute('pi.event', bytes.subarray(index * RAW_CHUNK_BYTES, (index + 1) * RAW_CHUNK_BYTES).toString('base64')),
+        attribute('pi.event.encoding', 'base64-json'), attribute('pi.event.id', eventId),
+        attribute('pi.event.fragment', index), attribute('pi.event.fragments', count),
+      ] });
+      enqueue(finish(run, child, span.spanId));
+    }
+  };
+
+  const setValue = (run: Run, span: OpenSpan, key: string, value: unknown) => {
+    const serialized = JSON.stringify(value);
+    const bytes = Buffer.byteLength(serialized);
+    const activeBytes = Buffer.byteLength(JSON.stringify(span.attributes));
+    if (bytes + activeBytes <= maxActiveBytes) span.attributes.push(attribute(key, serialized), attribute(key.replace('.value', '.mime_type'), 'application/json'));
+    else {
+      attach(run, span, { type: 'pi_span_value', key, value });
+      span.attributes.push(attribute(key + '.bytes', bytes), attribute(key + '.sha256', createHash('sha256').update(serialized).digest('hex')), attribute(key + '.storage', 'pi_span_value child events'));
+    }
   };
 
   const closeMessage = (run: Run, event?: Record<string, unknown>, unfinishedReason?: string) => {
-    if (!run.message && run.pendingMessage) {
-      run.message = run.pendingMessage;
-      run.pendingMessage = undefined;
-    }
-    if (!run.message) return;
+    const span = run.message ?? run.pendingMessage;
+    run.message = undefined;
+    run.pendingMessage = undefined;
+    if (!span) return;
     const message = record(event?.message);
     if (message) {
-      run.message.attributes.push(attribute('output.value', JSON.stringify(message)), attribute('output.mime_type', 'application/json'));
+      setValue(run, span, 'output.value', message);
       const usage = record(message.usage);
       const input = numeric(usage, ['input', 'inputTokens', 'input_tokens', 'prompt', 'promptTokens']);
       const output = numeric(usage, ['output', 'outputTokens', 'output_tokens', 'completion', 'completionTokens']);
       const total = numeric(usage, ['total', 'totalTokens', 'total_tokens']) ?? (input !== undefined && output !== undefined ? input + output : undefined);
-      if (input !== undefined) run.message.attributes.push(attribute('llm.token_count.prompt', input));
-      if (output !== undefined) run.message.attributes.push(attribute('llm.token_count.completion', output));
-      if (total !== undefined) run.message.attributes.push(attribute('llm.token_count.total', total));
-      for (const [source, target] of [['provider', 'llm.system'], ['model', 'llm.model_name']] as const) if (typeof message[source] === 'string') run.message.attributes.push(attribute(target, message[source]));
-      if (message.stopReason === 'error' || typeof message.errorMessage === 'string') run.message.failed = String(message.errorMessage ?? 'model error');
+      if (input !== undefined) span.attributes.push(attribute('llm.token_count.prompt', input));
+      if (output !== undefined) span.attributes.push(attribute('llm.token_count.completion', output));
+      if (total !== undefined) span.attributes.push(attribute('llm.token_count.total', total));
+      for (const [source, target] of [['provider', 'llm.system'], ['model', 'llm.model_name']] as const) if (typeof message[source] === 'string') span.attributes.push(attribute(target, message[source]));
+      if (message.stopReason === 'error' || typeof message.errorMessage === 'string') span.failed = String(message.errorMessage ?? 'model error');
     }
-    if (!message && unfinishedReason) run.message.failed ??= unfinishedReason;
-    enqueue(finish(run, run.message, run.root.spanId));
-    run.message = undefined;
+    if (!message && unfinishedReason) span.failed ??= unfinishedReason;
+    enqueue(finish(run, span, run.root.spanId));
   };
 
   const closeTools = (run: Run, reason: string) => {
-    for (const tool of run.tools.values()) { tool.failed ??= reason; enqueue(finish(run, tool, run.root.spanId)); }
+    const tools = [...run.tools.values()];
     run.tools.clear();
+    for (const tool of tools) {
+      tool.failed ??= reason;
+      try { enqueue(finish(run, tool, run.root.spanId)); }
+      catch (error) { process.stderr.write(`Phoenix could not persist closing tool: ${String(error)}\n`); }
+    }
   };
 
   const closeRun = (run: Run) => {
-    closeMessage(run, undefined, 'provider request ended without message_end');
-    closeTools(run, 'tool ended without tool_execution_end');
-    enqueue(finish(run, run.root));
-    const key = `${run.taskId}\0${run.runId}`;
-    runs.delete(key);
-    closedRuns.add(key);
-    closedOrder.push(key);
-    if (closedOrder.length > 1_024) closedRuns.delete(closedOrder.shift()!);
+    try {
+      try { closeMessage(run, undefined, 'provider request ended without message_end'); }
+      catch (error) { process.stderr.write(`Phoenix could not persist closing message: ${String(error)}\n`); }
+      closeTools(run, 'tool ended without tool_execution_end');
+      try { enqueue(finish(run, run.root)); }
+      catch (error) { process.stderr.write(`Phoenix could not persist closing run: ${String(error)}\n`); }
+    } finally {
+      const key = `${run.taskId}\0${run.runId}`;
+      runs.delete(key);
+      closedRuns.add(key);
+      closedParents.set(key, { spanId: run.root.spanId, sessionId: run.sessionId });
+      closedOrder.push(key);
+      if (closedOrder.length > 1_024) {
+        const oldest = closedOrder.shift()!;
+        closedRuns.delete(oldest);
+        closedParents.delete(oldest);
+      }
+    }
   };
+
+  const retry = setInterval(() => { void pump(); }, options.retryMs ?? 1_000);
+  retry.unref();
+  void pump();
 
   return {
     event(taskId, runId, value) {
@@ -231,10 +305,16 @@ export function createObserver(options: { endpoint: string; apiKey?: string }): 
       const key = `${taskId}\0${runId}`;
       const event = record(value);
       const type = typeof event?.type === 'string' ? event.type : 'unknown';
-      if (closedRuns.has(key)) return;
       let run = runs.get(key);
+      if (closedRuns.has(key)) {
+        if (type !== 'pi_tool_output') return;
+        const parent = closedParents.get(key)!;
+        const root = open('pi.run', 'AGENT');
+        root.spanId = parent.spanId;
+        run = { taskId, runId, traceId: traceId(taskId, runId), sessionId: parent.sessionId, root, tools: new Map(), toolParents: new Map() };
+      }
       if (!run) {
-        run = { taskId, runId, traceId: traceId(taskId, runId), sessionId: taskId, root: open('pi.run', 'AGENT'), tools: new Map() };
+        run = { taskId, runId, traceId: traceId(taskId, runId), sessionId: taskId, root: open('pi.run', 'AGENT'), tools: new Map(), toolParents: new Map() };
         runs.set(key, run);
       }
       if (type === 'session' && typeof event?.id === 'string') run.sessionId = event.id;
@@ -243,51 +323,61 @@ export function createObserver(options: { endpoint: string; apiKey?: string }): 
         if (type === 'pi_provider_request') {
           closeMessage(run, undefined, 'provider request was superseded before message_end');
           const request = open('pi.llm', 'LLM');
-          request.attributes.push(attribute('input.value', JSON.stringify(event?.payload)), attribute('input.mime_type', 'application/json'));
+          setValue(run, request, 'input.value', event?.payload);
           if (typeof event?.provider === 'string') request.attributes.push(attribute('llm.system', event.provider));
           if (typeof event?.model === 'string') request.attributes.push(attribute('llm.model_name', event.model));
-          attach(request, value);
+          attach(run, request, value);
           run.pendingMessage = request;
         } else if (type === 'message_start' && record(event?.message)?.role === 'assistant') {
           if (run.message) closeMessage(run, undefined, 'assistant message was superseded before message_end');
           run.message = run.pendingMessage ?? open('pi.llm', 'LLM', [attribute('llm.system', 'pi')]);
           run.pendingMessage = undefined;
-          attach(run.message, value);
+          attach(run, run.message, value);
         } else if ((type === 'message_update' || type === 'message_end') && run.message) {
-          attach(run.message, value);
-          if (type === 'message_end') closeMessage(run, event);
+          try { attach(run, run.message, value); }
+          finally { if (type === 'message_end') closeMessage(run, event); }
         } else if (type === 'tool_execution_start' && typeof event?.toolCallId === 'string') {
           const tool = open(`pi.tool.${typeof event.toolName === 'string' ? event.toolName : 'unknown'}`, 'TOOL');
           if (typeof event.toolName === 'string') tool.attributes.push(attribute('tool.name', event.toolName));
-          if (event.args !== undefined) tool.attributes.push(attribute('input.value', JSON.stringify(event.args)), attribute('input.mime_type', 'application/json'));
-          attach(tool, value);
+          if (event.args !== undefined) setValue(run, tool, 'input.value', event.args);
+          attach(run, tool, value);
           run.tools.set(event.toolCallId, tool);
+          run.toolParents.set(event.toolCallId, tool.spanId);
+          if (run.toolParents.size > 1_024) run.toolParents.delete(run.toolParents.keys().next().value!);
+        } else if (type === 'pi_tool_output' && typeof event?.toolCallId === 'string') {
+          if (typeof event.data !== 'string' || Buffer.byteLength(event.data) > RAW_CHUNK_BYTES || !Number.isSafeInteger(event.sequence) || (event.sequence as number) < 0) throw new Error('Invalid pi_tool_output chunk: expected sequence and at most 32KiB data');
+          attach(run, { spanId: run.toolParents.get(event.toolCallId) ?? run.root.spanId }, value);
         } else if (type.startsWith('tool_execution_') && typeof event?.toolCallId === 'string' && run.tools.has(event.toolCallId)) {
           const tool = run.tools.get(event.toolCallId)!;
-          attach(tool, value);
-          if (type === 'tool_execution_end') {
-            if (event.result !== undefined) tool.attributes.push(attribute('output.value', JSON.stringify(event.result)), attribute('output.mime_type', 'application/json'));
-            if (event.isError === true) tool.failed = 'tool execution failed';
-            enqueue(finish(run, tool, run.root.spanId));
-            run.tools.delete(event.toolCallId);
+          try { attach(run, tool, value); }
+          finally {
+            if (type === 'tool_execution_end') {
+              run.tools.delete(event.toolCallId);
+              if (event.result !== undefined) setValue(run, tool, 'output.value', event.result);
+              if (event.isError === true) tool.failed = 'tool execution failed';
+              enqueue(finish(run, tool, run.root.spanId));
+            }
           }
-        } else attach(run.root, value);
+        } else attach(run, run.root, value);
         const eventError = event?.error;
         if (type.includes('error') || eventError !== undefined) run.root.failed = typeof eventError === 'string' ? eventError : eventError === undefined ? type : JSON.stringify(eventError);
         if (event?.cancelled === true) run.root.failed ??= 'cancelled';
-        if (type === 'agent_settled' || type === 'run_end') closeRun(run);
       } catch (error) {
-        dropped++;
-        process.stderr.write(`Phoenix could not serialize one Pi event: ${String(error)}\n`);
+        process.stderr.write(`Phoenix could not persist Pi event (${taskId}/${runId}/${type}): ${String(error)}\n`);
+      } finally {
+        if (type === 'agent_settled' || type === 'run_end') closeRun(run);
       }
       void pump();
     },
     async close() {
       closed = true;
-      for (const run of [...runs.values()]) closeRun(run);
+      clearInterval(retry);
+      for (const run of [...runs.values()]) {
+        try { closeRun(run); } catch (error) { process.stderr.write(`Phoenix could not persist closing run: ${String(error)}\n`); }
+      }
       await sending;
-      if (queue.length || dropped) await pump();
-      if (dropped) process.stderr.write(`Phoenix observer closed with ${dropped} unexported complete event(s)\n`);
+      await pump();
+      if (spoolBytes) process.stderr.write(`Phoenix observer closed with ${spoolBytes} bytes pending on disk\n`);
     },
   };
 }

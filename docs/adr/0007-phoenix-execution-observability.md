@@ -6,6 +6,6 @@
 
 Phoenix 内容允许公开查看，不要求访问者登录或进行查看权限校验；此决定替代此前仅限已授权团队成员访问的方案。公开入口仅允许读取，追踪上报、删除和管理操作只开放给内部服务。部署需区分公开读取入口与内部写入、管理入口，不能仅关闭 Phoenix 认证并暴露完整服务；具体实现仍待设计和验证。
 
-Phoenix 不可用时任务继续，追踪上报失败不阻塞告警处理；任务状态、Owner 指令和关键操作记录由告警应用独立持久保存。中断期间追踪数据的缓存和补传策略尚未确定。
+Phoenix 不可用时任务继续，追踪上报失败不阻塞告警处理；任务状态、Owner 指令和关键操作记录由告警应用独立持久保存。原始事件分块增量落盘，完成的 span 保存在 DATA_DIR/trace-spool，成功上报后才删除，启动及空闲重试均补传；缓存上限 1 GiB。磁盘满或存储故障时明确记录未保存的事件，不能承诺超出容量后的追踪完整性；终止轮次仍释放内存状态。
 
 参考：[Phoenix](https://github.com/Arize-ai/phoenix)、[OpenTelemetry 接入](https://arize.com/docs/phoenix/tracing/how-to-tracing/setup-tracing/setup-using-phoenix-otel)。

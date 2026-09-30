@@ -251,6 +251,7 @@ export class PiRunner {
 
     return await new Promise<PiRunResult>((resolveRun, rejectRun) => {
       let buffer = "";
+      let bufferBytes = 0;
       let stderr = "";
       let finalText = "";
       let usage: unknown;
@@ -278,6 +279,7 @@ export class PiRunner {
       };
       const consume = (line: string) => {
         if (failure) return;
+        if (Buffer.byteLength(line)>8*1024*1024) { fail(new PiRunError("protocol","Pi event exceeds the 8 MiB transport limit",stderr)); return; }
         let event: EventRecord;
         try {
           event = JSON.parse(line) as EventRecord;
@@ -295,18 +297,23 @@ export class PiRunner {
       };
       child.stdout?.setEncoding("utf8");
       child.stdout?.on("data", (chunk: string) => {
+        if(failure)return;
         buffer += chunk;
+        bufferBytes += Buffer.byteLength(chunk);
         for (;;) {
           const end = buffer.indexOf("\n");
           if (end < 0) break;
           const line = buffer.slice(0, end).replace(/\r$/, "");
+          bufferBytes -= Buffer.byteLength(buffer.slice(0,end+1));
           buffer = buffer.slice(end + 1);
           if (line) consume(line);
+          if(failure){buffer="";bufferBytes=0;return;}
         }
+        if(bufferBytes>8*1024*1024){buffer="";bufferBytes=0;fail(new PiRunError("protocol","Pi event exceeds the 8 MiB transport limit",stderr));}
       });
       child.stderr?.setEncoding("utf8");
-      child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
-      child.on("error", (error) => fail(new PiRunError("spawn", `Could not start Pi: ${error.message}`, stderr)));
+      child.stderr?.on("data", (chunk: string) => { stderr = (stderr + chunk).slice(-64*1024); });
+      child.on("error", (error) => { if(!reason)fail(new PiRunError("spawn", `Could not start Pi: ${error.message}`, stderr)); });
       child.on("close", (code, signal) => {
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);

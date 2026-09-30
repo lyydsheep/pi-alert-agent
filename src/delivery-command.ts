@@ -46,7 +46,7 @@ function mergeRequest(value: unknown): MergeRequest {
   };
 }
 
-function stop(child: ChildProcess, signal: NodeJS.Signals): void {
+export function stop(child: ChildProcess, signal: NodeJS.Signals): void {
   if (!child.pid) return;
   try {
     if (process.platform !== 'win32') process.kill(-child.pid, signal);
