@@ -22,5 +22,5 @@ export async function acquireServiceLock(dataDir:string):Promise<()=>Promise<voi
     }
     await writeFile(join(lock,'pid'),String(process.pid));
   } finally {await rm(claim,{recursive:true});}
-  return async()=>{await rm(lock,{recursive:true});};
+  return async()=>{await rm(lock,{recursive:true,force:true});};
 }

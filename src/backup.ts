@@ -1,6 +1,7 @@
 import { cp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { resolve, join, relative, isAbsolute } from 'node:path';
 import { DatabaseSync, backup as sqliteBackup } from 'node:sqlite';
+import { acquireServiceLock } from './lock.ts';
 
 async function assertStopped(dataDir:string):Promise<void> {
   let raw:string;
@@ -15,6 +16,8 @@ export async function backupData(dataDir:string,destination:string):Promise<void
   const rel=relative(dataDir,destination);
   if(!rel||(!rel.startsWith('..')&&!isAbsolute(rel)))throw new Error('Backup destination must be outside data directory');
   await assertStopped(dataDir);
+  const release=await acquireServiceLock(dataDir);
+  try {
   await mkdir(destination,{recursive:false,mode:0o700});
   try {
     const db=new DatabaseSync(join(dataDir,'tasks.sqlite'),{readOnly:true});
@@ -25,6 +28,7 @@ export async function backupData(dataDir:string,destination:string):Promise<void
     }
     await writeFile(join(destination,'backup.json'),JSON.stringify({format:1,dataDir,createdAt:new Date().toISOString(),scope:'same-host; target business repository and task refs must be retained separately'},null,2),{mode:0o600});
   } catch(error){await rm(destination,{recursive:true,force:true});throw error;}
+  } finally {await release();}
 }
 
 export async function restoreData(source:string,dataDir:string):Promise<void> {
@@ -33,5 +37,9 @@ export async function restoreData(source:string,dataDir:string):Promise<void> {
   await assertStopped(dataDir);
   // Refuse to overwrite live data. Operator archives the old directory first.
   await mkdir(dataDir,{recursive:false,mode:0o700});
-  for(const item of await readdir(source))if(item!=='backup.json')await cp(join(source,item),join(dataDir,item),{recursive:true,dereference:false,verbatimSymlinks:true,preserveTimestamps:true});
+  const release=await acquireServiceLock(dataDir);
+  try {
+    for(const item of await readdir(source))if(item!=='backup.json'&&item!=='service.lock'&&item!=='startup.lock')await cp(join(source,item),join(dataDir,item),{recursive:true,dereference:false,verbatimSymlinks:true,preserveTimestamps:true});
+  } catch(error) {await rm(dataDir,{recursive:true,force:true});throw error;}
+  finally {await release();}
 }

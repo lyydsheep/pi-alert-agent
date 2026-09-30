@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {backupData,restoreData} from '../src/backup.ts';
+import {acquireServiceLock} from '../src/lock.ts';
 
 test('stopped service backup restores SQLite and session evidence without overwriting live data',async()=>{
   const root=await mkdtemp(join(tmpdir(),'alert-backup-'));const data=join(root,'data');const copy=join(root,'backup');await mkdir(data);
@@ -21,6 +22,12 @@ test('stopped service backup restores SQLite and session evidence without overwr
     assert.equal(await readlink(join(data,'sessions','latest')),'task.jsonl');
     assert.equal(await readlink(join(data,'sessions','pending')),'missing-evidence');
     assert.equal(JSON.parse(await readFile(join(data,'delivery','operations.json'),'utf8')).reviewRequests.head.status,'outcome_unknown');
+    await mkdir(join(data,'startup.lock'));
+    await assert.rejects(backupData(data,join(root,'startup-race')),{code:'EEXIST'});
+    await rm(join(data,'startup.lock'),{recursive:true});
+    const release=await acquireServiceLock(data);
+    await assert.rejects(backupData(data,join(root,'locked-backup')),/Stop the service/);
+    await release();
     await mkdir(join(data,'service.lock'));await writeFile(join(data,'service.lock','pid'),String(process.pid));
     await assert.rejects(backupData(data,join(root,'running')),/Stop the service/);
   }finally{await rm(root,{recursive:true,force:true});}
