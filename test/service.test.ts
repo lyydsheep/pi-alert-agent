@@ -96,6 +96,27 @@ function fixture(t: TestContext, run: (input: PiRunInput) => Promise<PiRunResult
   };
 }
 
+test('ambiguous Owner targets are rejected and quoted alert context is retained',async t=>{
+  const f=fixture(t,async input=>result(input,'plan'));
+  await f.service.receive(message('quoted-alert','排查 失败','owner','[告警:alerts:original] 原始日志与详情'));
+  assert.match(f.service.engine.events(1)[0].text,/原始日志与详情/);
+  await f.service.receive(message('other-alert','[告警:alerts:other] down'));
+  await f.service.pump();
+  await eventually(()=>f.service.engine.listTasks().every(task=>task.status==='plan_notify_pending'),'both plans');
+  await f.service.pump();
+  const before=f.service.engine.listTasks().map(task=>task.status);
+  await f.service.receive(message('ambiguous','任务 #2 同意','owner','[告警方案:1:1]'));
+  assert.deepEqual(f.service.engine.listTasks().map(task=>task.status),before);
+  assert.match(f.notifications.at(-1)!.text,/冲突|不一致/);
+  await f.service.receive(message('ambiguous-alert','任务 #2 同意','owner','[告警:alerts:original]'));
+  assert.deepEqual(f.service.engine.listTasks().map(task=>task.status),before);
+  await f.service.receive(message('approve-quoted-alert','同意','owner','[告警:alerts:original]'));
+  assert.equal(f.service.engine.getTask(1)?.status,'ready');
+  assert.equal(f.service.engine.getTask(2)?.status,before[1]);
+  await f.service.receive(message('same-alert','排查 再看一次','owner','[告警:alerts:original] 原始日志与详情'));
+  assert.equal(f.service.engine.listTasks().length,2);
+});
+
 test('runs intake through approved fix, MR, current checks and delivery', async (t) => {
   const phases: string[] = [];
   const f = fixture(t, async (input) => {

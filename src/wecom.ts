@@ -5,6 +5,8 @@ export interface IncomingMessage {
 }
 export type OwnerCommand = 'approve' | 'defer' | 'pause' | 'reject' | 'resume' | 'unknown' | 'confirm';
 
+export class MessageAmbiguityError extends Error {}
+
 // Only call with a frame received on the authenticated bot connection.
 export function incomingFrame(frame: unknown, botMention?: string): IncomingMessage {
   const body = (frame as { body?: Record<string, any> })?.body;
@@ -33,17 +35,38 @@ export function commandFrom(text: string): OwnerCommand | undefined {
 }
 
 export function targetFrom(message: IncomingMessage): { taskId: number; planVersion?: number } | undefined {
-  const match = `${message.text}\n${message.quote}`.match(/\[告警方案:(\d+):(\d+)\]/);
-  if (match) return { taskId: Number(match[1]), planVersion: Number(match[2]) };
-  const id = message.text.match(/(?:任务|task)\s*#?(\d+)/i);
-  return id ? { taskId: Number(id[1]) } : undefined;
+  const content = `${message.text}\n${message.quote}`;
+  const markers = [...content.matchAll(/\[告警方案:(\d+):(\d+)\]/g)];
+  const ids = new Set([...markers.map(match => Number(match[1])),
+    ...[...content.matchAll(/(?:任务|task)\s*#?(\d+)/gi)].map(match => Number(match[1]))]);
+  const versions = new Set(markers.map(match => Number(match[2])));
+  if ([...ids, ...versions].some(value => !Number.isSafeInteger(value)) || [...ids].some(value => value < 1)) {
+    throw new MessageAmbiguityError('任务编号或方案版本无效，请引用有效方案。');
+  }
+  if (ids.size > 1 || versions.size > 1) {
+    throw new MessageAmbiguityError('消息与引用中的任务编号或方案版本不一致，请明确唯一目标。');
+  }
+  const taskId = [...ids][0];
+  return taskId === undefined ? undefined : versions.size ? { taskId, planVersion: [...versions][0] } : { taskId };
 }
 
 export function eventFrom(message: IncomingMessage, config?:{source:string;eventIdPattern:string}): { source: string; eventId: string } | undefined {
   // Explicit event identities only. Similar prose is never a deduplication key.
-  const identity = message.text.match(/\[告警:([^:\]\s]+):([^\]\s]+)\]/);
-  if (identity) return { source: identity[1], eventId: identity[2] };
-  if(config){const id=new RegExp(config.eventIdPattern).exec(message.text)?.groups?.eventId;if(id)return {source:config.source,eventId:id};}
+  const identities: Array<{ source: string; eventId: string }> = [];
+  for (const content of [message.text, message.quote]) {
+    const markers = [...content.matchAll(/\[告警:([^:\]\s]+):([^\]\s]+)\]/g)];
+    identities.push(...markers.map(match => ({ source: match[1], eventId: match[2] })));
+    if (!markers.length && config) {
+      for (const match of content.matchAll(new RegExp(config.eventIdPattern, 'g'))) {
+        if (match.groups?.eventId) identities.push({ source: config.source, eventId: match.groups.eventId });
+      }
+    }
+  }
+  const identity = identities[0];
+  if (identities.some(value => value.source !== identity?.source || value.eventId !== identity?.eventId)) {
+    throw new MessageAmbiguityError('消息与引用中的告警来源或事件编号不一致，请明确唯一告警。');
+  }
+  if (identity) return identity;
   if (/^(排查|调查|investigate)\s+/i.test(message.text)) {
     return { source: 'wecom-request', eventId: createHash('sha256').update(`${message.groupId}\0${message.messageId}`).digest('hex') };
   }

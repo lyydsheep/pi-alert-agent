@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { Engine, type Effect, type Task } from './engine.ts';
 import { Store } from './store.ts';
-import { commandFrom, eventFrom, targetFrom, type IncomingMessage } from './wecom.ts';
+import { commandFrom, eventFrom, targetFrom, MessageAmbiguityError, type IncomingMessage } from './wecom.ts';
 import type { Config } from './config.ts';
 import type { PiRunner } from './pi/index.ts';
 import { GitWorkspaceConflictError, type GitWorkspaceManager, type GitWorkspace } from './git.ts';
@@ -52,17 +52,20 @@ export class AlertService {
     const inboxKey=`${message.groupId}:${message.messageId}`;
     if(this.store.get('SELECT message_id FROM inbox WHERE message_id=?',inboxKey))return;
     const result=this.store.transaction(()=>{
+    try {
     const explicit=targetFrom(message);
     const command=commandFrom(message.text);
     const event=eventFrom(message,this.config.intake);
+    const eventTask=event?this.engine.listTasks().find(t=>t.source===event.source&&t.eventId===event.eventId):undefined;
+    if(explicit&&event&&(!eventTask||eventTask.id!==explicit.taskId))throw new MessageAmbiguityError('任务编号与引用告警不一致，请明确唯一目标。');
     let result:string;
     if(event && !explicit && !command) {
       if(event.source==='wecom-request'&&!this.config.groups[message.groupId].owners.includes(message.senderId))return '仅配置的 Owner 可以主动发起排查。';
-      const intake=this.engine.intake({...event,groupId:message.groupId,senderId:message.senderId,text:message.text});
+      const intake=this.engine.intake({...event,groupId:message.groupId,senderId:message.senderId,text:message.quote?`${message.text}\n\n引用消息：\n${message.quote}`:message.text});
       result=`任务 #${intake.task.id}：${intake.created?'已接收，等待调查':'已关联已有告警任务'}。`;
     } else {
       const candidates=this.engine.listTasks().filter(t=>t.groupId===message.groupId && !['closed','delivered'].includes(t.status));
-      const task=explicit?this.engine.getTask(explicit.taskId):candidates.length===1?candidates[0]:undefined;
+      const task=explicit?this.engine.getTask(explicit.taskId):event?eventTask:candidates.length===1?candidates[0]:undefined;
       if(!task) result=command||explicit?'请引用对应方案，或使用“任务 #编号 指令”明确目标。':'请补充 [告警:来源:事件ID]，或使用“排查 问题描述”发起调查。';
       else if(task.groupId!==message.groupId||!task.ownerIds.includes(message.senderId))result='仅任务所属群配置的 Owner 可以操作该任务。';
       else if(/(?:^|\s)(?:补充|信息|information)\s+\S/i.test(message.text)) {
@@ -79,6 +82,11 @@ export class AlertService {
     }
     this.store.run('INSERT OR IGNORE INTO inbox(message_id,received_at) VALUES(?,?)',inboxKey,this.now());
     return result;
+    } catch(error) {
+      if(!(error instanceof MessageAmbiguityError))throw error;
+      this.store.run('INSERT OR IGNORE INTO inbox(message_id,received_at) VALUES(?,?)',inboxKey,this.now());
+      return error.message;
+    }
     });
     await this.deps.notify(message.groupId,result,[]);
   }

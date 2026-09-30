@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { incomingFrame, targetFrom, commandFrom, eventFrom, sendGroup } from '../src/wecom.ts';
+import { incomingFrame, targetFrom, commandFrom, eventFrom, sendGroup, MessageAmbiguityError } from '../src/wecom.ts';
 
 test('authenticated origin, quoted plan and exact intent remain separate', () => {
   const message = incomingFrame({ body: { chattype:'group', msgtype:'text', chatid:'g', msgid:'m', from:{userid:'u'}, text:{content:'等一下'}, quote:{text:{content:'[告警方案:12:3]'}} } });
@@ -12,6 +12,35 @@ test('authenticated origin, quoted plan and exact intent remain separate', () =>
   assert.deepEqual(eventFrom({...message,text:'[告警:source:event-1] service failed'}), {source:'source',eventId:'event-1'});
   assert.equal(eventFrom({...message,text:'similar service failed'}), undefined);
   assert.notEqual(eventFrom({...message,text:'排查 故障'})?.eventId, eventFrom({...message,messageId:'m2',text:'排查 故障'})?.eventId);
+});
+
+test('rejects conflicting task IDs and plan versions instead of choosing a target', () => {
+  const message = {messageId:'m', groupId:'g', senderId:'u', text:'任务 #2 同意', quote:'[告警方案:1:1]'};
+  for (const [text, quote] of [
+    [message.text, message.quote],
+    ['任务 #1 task #2 同意', ''],
+    ['[告警方案:1:2] 同意', '[告警方案:1:1]'],
+    ['同意', '[告警方案:1:1] [告警方案:2:1]'],
+    ['任务 #1 同意', '任务 #2 需要 Owner 介入'],
+  ]) assert.throws(() => targetFrom({...message, text, quote}), MessageAmbiguityError);
+  assert.deepEqual(targetFrom({...message,text:'任务 #1 同意'}), {taskId:1,planVersion:1});
+  assert.deepEqual(targetFrom({...message,text:'[告警方案:1:1] 任务 #1 同意'}), {taskId:1,planVersion:1});
+  assert.deepEqual(targetFrom({...message,text:'同意'}), {taskId:1,planVersion:1});
+});
+
+test('quoted alerts preserve event identity and conflicting identities are rejected', () => {
+  const message = {messageId:'m', groupId:'g', senderId:'u', text:'排查 这个告警', quote:'[告警:source:event-1] service failed'};
+  assert.deepEqual(eventFrom(message), {source:'source',eventId:'event-1'});
+  assert.deepEqual(eventFrom({...message,text:'[告警:source:event-1] 排查'}), {source:'source',eventId:'event-1'});
+  for (const text of ['[告警:source:event-2] 排查', '[告警:other:event-1] 排查']) {
+    assert.throws(() => eventFrom({...message,text}), MessageAmbiguityError);
+  }
+  assert.throws(() => eventFrom({...message,quote:'[告警:source:event-1] [告警:source:event-2]'}), MessageAmbiguityError);
+  const config = {source:'monitor',eventIdPattern:'event=(?<eventId>[a-z0-9-]+)'};
+  assert.deepEqual(eventFrom({...message,quote:'event=original-1'},config), {source:'monitor',eventId:'original-1'});
+  assert.throws(() => eventFrom({...message,text:'event=other',quote:'event=original-1'},config), MessageAmbiguityError);
+  assert.throws(() => eventFrom({...message,text:'[告警:monitor:other] 排查',quote:'event=original-1'},config), MessageAmbiguityError);
+  assert.equal(eventFrom({...message,text:'同意',quote:'[告警方案:1:1]'}), undefined);
 });
 
 test('removes only the configured leading bot mention before parsing Owner commands', () => {
