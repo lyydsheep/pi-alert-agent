@@ -5,14 +5,15 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {loadConfig} from '../src/config.ts';
 
-test('configuration rejects groups without an Owner before enabling timeout execution',()=>{
+test('configuration allows missing Owners for safe needs_owner routing and rejects malformed groups',()=>{
   const root=mkdtempSync(join(tmpdir(),'alert-config-'));const path=join(root,'config.json');
   const config={dataDir:root,repositoryPath:root,bot:{id:'test',secret:'test'},model:{id:'test',provider:'test',apiKey:'test'},delivery:{apiEndpoint:'https://example.invalid',token:'test',project:'test',agentReviewCheck:'review',requiredChecks:['tests']},groups:{test:{owners:['owner'],webhook:'https://example.invalid'}}};
   try{
     writeFileSync(path,JSON.stringify(config));assert.equal(loadConfig(path).concurrency,4);
     for(const dashboardUrl of ['javascript:alert(1)','https://user:secret@alerts.test','https://alerts.test/?token=bad']){writeFileSync(path,JSON.stringify({...config,dashboardUrl}));assert.throws(()=>loadConfig(path));}
     writeFileSync(path,JSON.stringify({...config,dashboardUrl:'https://alerts.test/'}));assert.equal(loadConfig(path).dashboardUrl,'https://alerts.test/');
-    for(const groups of [{},[],{test:null},{test:{owners:[],webhook:'https://example.invalid'}},{test:{owners:[' '],webhook:'https://example.invalid'}}]){
+    writeFileSync(path,JSON.stringify({...config,groups:{test:{owners:[],webhook:'https://example.invalid'}}}));assert.deepEqual(loadConfig(path).groups.test.owners,[]);
+    for(const groups of [{},[],{test:null},{test:{owners:[' '],webhook:'https://example.invalid'}}]){
       writeFileSync(path,JSON.stringify({...config,groups}));assert.throws(()=>loadConfig(path),/configuration/);
     }
     writeFileSync(path,JSON.stringify({...config,delivery:{command:process.execPath,args:['bridge.mjs'],project:'project',agentReviewCheck:'review',requiredChecks:['tests']}}));

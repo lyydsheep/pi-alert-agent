@@ -42,7 +42,7 @@ export function loadConfig(file: string): Config {
   }else if(!c.delivery.apiEndpoint||!c.delivery.token)throw new Error('Explicit delivery/check configuration required');
   if(c.delivery.timeoutMs!==undefined&&(!Number.isSafeInteger(c.delivery.timeoutMs)||c.delivery.timeoutMs<1))throw new Error('Invalid delivery timeoutMs');
   if(!c.groups||typeof c.groups!=='object'||Array.isArray(c.groups)||!Object.keys(c.groups).length)throw new Error('Group configuration required');
-  for(const group of Object.values(c.groups) as any[])if(!group||!Array.isArray(group.owners)||!group.owners.length||group.owners.some((x:any)=>typeof x!=='string'||!x.trim())||typeof group.webhook!=='string'||!group.webhook)throw new Error('Invalid group configuration');
+  for(const group of Object.values(c.groups) as any[])if(!group||!Array.isArray(group.owners)||group.owners.some((x:any)=>typeof x!=='string'||!x.trim())||typeof group.webhook!=='string'||!group.webhook)throw new Error('Invalid group configuration');
   if(c.skills&&(!Array.isArray(c.skills)||c.skills.some((x:any)=>typeof x!=='string')))throw new Error('Invalid skills paths');
   if(c.intake){if(typeof c.intake.source!=='string'||typeof c.intake.eventIdPattern!=='string')throw new Error('Invalid intake config');new RegExp(c.intake.eventIdPattern);}
   if(c.dashboardUrl!==undefined){const url=new URL(c.dashboardUrl);if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error('Invalid dashboardUrl');}
